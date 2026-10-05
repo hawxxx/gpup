@@ -118,13 +118,96 @@ For frontend development, run `./bin/gpup serve` and `make dev` in separate term
 
 ## Deployment
 
-Packaging examples live under [deploy](deploy): Docker/Compose, a Helm chart, and a loopback systemd service. Compose publishes only to host loopback and keeps SQLite in a named volume. Set `GPUP_API_TOKEN` before starting it:
+Run the following commands from the repository root. Docker builds the frontend and backend inside the image, so you do not need Go or Node.js installed on the host. Packaging also includes a [systemd service](deploy/systemd/gpup.service).
+
+### Docker Compose
+
+Requires Docker Engine and the Docker Compose plugin. Set `GPUP_API_TOKEN` from your secret manager or an existing token file outside the repository, then build and start GPUP:
 
 ```sh
-docker compose -f deploy/docker/compose.yaml up --build
+export GPUP_API_TOKEN="$(cat /secure/gpup-token)"
+docker compose -f deploy/docker/compose.yaml up --build -d
+docker compose -f deploy/docker/compose.yaml logs -f gpup
 ```
 
-The dashboard requires the configured token. GPU collection in containers requires additional NVIDIA device access; see [GPU collection](#gpu-collection).
+Open <http://127.0.0.1:7331> and enter the token in the dashboard. Compose publishes only to host loopback and stores SQLite in the `gpup-data` named volume. Press Ctrl+C to stop following logs; the service keeps running.
+
+Register an inference server at a URL reachable **from the container**, then run a benchmark:
+
+```sh
+docker compose -f deploy/docker/compose.yaml exec gpup \
+  gpup --db /data/gpup.db target add inference \
+  --url http://inference:8000/v1 --engine vllm --model my-model \
+  --metrics-url http://inference:8000/metrics
+
+docker compose -f deploy/docker/compose.yaml exec gpup \
+  gpup --db /data/gpup.db status
+
+docker compose -f deploy/docker/compose.yaml exec gpup \
+  gpup --db /data/gpup.db bench inference --model my-model \
+  --concurrency 1,2,4 --duration 30s --save baseline
+```
+
+Replace `inference`, port 8000, and `my-model` with your server's address and model ID. A container name such as `inference` resolves only when both containers share a Docker network; attach GPUP to the inference service's network in your Compose configuration. Container `127.0.0.1` refers to the GPUP container. For a host inference server, use `host.docker.internal` on Docker Desktop; on Linux, add an `extra_hosts` entry mapping `host.docker.internal` to `host-gateway`. The inference server must listen on an interface reachable from that network.
+
+Always pass `--db /data/gpup.db` to container CLI commands so they use the server's database. For an authenticated inference endpoint, pass its key through the container environment and register the corresponding `--api-key-env` name; the server needs that variable too.
+
+Stop the deployment with:
+
+```sh
+docker compose -f deploy/docker/compose.yaml down
+```
+
+The named volume remains available for the next start. `down --volumes` deletes the stored targets and runs.
+
+For GPU collection, configure NVIDIA Container Toolkit on the host and enable the commented `gpus: all` setting in [compose.yaml](deploy/docker/compose.yaml). The image uses `nvidia-smi` fallback and needs NVIDIA utility access. This setup monitors GPUs visible to the container; inference endpoints can be monitored without GPU access.
+
+### Kubernetes with Helm
+
+Requires a Kubernetes cluster, `kubectl`, Helm, and a registry your cluster can pull from. The chart deploys GPUP; provision your inference server separately. Replace `registry.example.com/your-team/gpup` with your image repository:
+
+```sh
+docker build -f deploy/docker/Dockerfile \
+  -t registry.example.com/your-team/gpup:0.1.0 .
+docker push registry.example.com/your-team/gpup:0.1.0
+
+kubectl create namespace gpup
+kubectl -n gpup create secret generic gpup-token \
+  --from-file=token=/secure/gpup-token
+
+helm upgrade --install gpup deploy/helm/gpup --namespace gpup \
+  --set image.repository=registry.example.com/your-team/gpup \
+  --set image.tag=0.1.0
+
+kubectl -n gpup rollout status deployment/gpup
+kubectl -n gpup port-forward service/gpup 7331:7331
+```
+
+Use an existing token file containing only the token, without a trailing newline, or provision the Secret through your secret manager. If the namespace already exists, skip its creation. For a private registry, configure image pull credentials for the workload's default ServiceAccount before installing.
+
+Keep port-forward running, open <http://127.0.0.1:7331>, and enter the same token. In another terminal, register your inference service using its Kubernetes DNS name:
+
+```sh
+kubectl -n gpup exec deployment/gpup -- \
+  gpup --db /data/gpup.db target add inference \
+  --url http://vllm.inference.svc.cluster.local:8000/v1 \
+  --engine vllm --model my-model \
+  --metrics-url http://vllm.inference.svc.cluster.local:8000/metrics
+
+kubectl -n gpup exec deployment/gpup -- \
+  gpup --db /data/gpup.db bench inference --model my-model \
+  --concurrency 1,2,4 --duration 30s --save baseline
+
+kubectl -n gpup logs deployment/gpup
+```
+
+Replace `vllm`, namespace `inference`, port 8000, and `my-model` with your inference Service and model. Its network policy must allow traffic from GPUP. Authenticated inference endpoints also need their key environment variable injected into the GPUP pod; the chart's `gpup-token` Secret authenticates GPUP's API, not the inference server.
+
+The chart runs one replica with SQLite on a 1 GiB PVC and uses Recreate updates. It requires a default StorageClass unless you set `--set persistence.storageClass=YOUR_STORAGE_CLASS`. `--set persistence.enabled=false` uses ephemeral storage and loses data when the pod is replaced.
+
+The Service is ClusterIP. Port-forward provides local access; external ingress and TLS require additional configuration. The chart does not provision GPU access, an inference engine, or DCGM Exporter. GPU monitoring requires NVIDIA runtime/device access and scheduling GPUP on the GPU node. A remote DCGM URL supplements already identified local GPUs; it does not discover a GPU fleet. Independent GPUP instances do not aggregate into a cluster dashboard.
+
+See the [Helm guide](deploy/helm/gpup/README.md) and [chart values](deploy/helm/gpup/values.yaml) for token Secret overrides, storage, resource limits, DCGM, and read-only mode.
 
 ## Scope and further reading
 
