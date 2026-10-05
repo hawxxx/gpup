@@ -1,25 +1,41 @@
 # GPUP
 
-GPUP is a local inference observability and benchmarking tool. A Go executable embeds the React dashboard and persists targets, request metadata, and runs in SQLite. The original `index.html` remains a simulated visual prototype; run the executable for the live application.
+GPUP is a local inference observability and benchmarking tool for OpenAI-compatible inference servers and NVIDIA GPUs. Monitor requests and GPU telemetry, benchmark concurrency levels, and compare saved runs from a CLI or React dashboard.
 
-## Build and run
+A single Go executable serves the dashboard and stores targets, request metadata, and runs in SQLite. The original `index.html` is a separate, simulated visual prototype; use the executable for the live application.
 
-Install Go 1.22 or newer and Node.js 22 with npm. A C compiler is needed for native NVML support; the NVIDIA driver library is loaded at runtime.
+## Quick start
+
+Building from source requires Go 1.22 or newer, Node.js 22 with npm, and Make. Native NVML collection also requires a C compiler and a usable NVIDIA driver; the driver library is loaded at runtime. Node.js is only needed to build or develop the frontend.
 
 ```sh
+git clone https://github.com/hawxxx/gpup.git
+cd gpup
 make build
 ./bin/gpup serve
-# Same dashboard server:
-./bin/gpup ui
 ```
 
-Open `http://127.0.0.1:7331`. The database defaults to the user configuration directory's `gpup/gpup.db`. Override it with `--db /path/to/gpup.db`. The binary includes the built frontend; Node is only needed during development/build.
+Open <http://127.0.0.1:7331>. `./bin/gpup ui` starts the same server. Inference monitoring requires a running compatible endpoint; you can register one from another terminal while the dashboard is running. A local GPU is optional.
+
+## Connect an inference server
+
+Replace `my-model` with the model ID exposed by your server. The example assumes a vLLM server on port 8000:
 
 ```sh
 ./bin/gpup target add local --url http://127.0.0.1:8000/v1 --engine vllm \
   --model my-model --metrics-url http://127.0.0.1:8000/metrics
+./bin/gpup target list
 ./bin/gpup status
 ./bin/gpup models
+```
+
+`--metrics-url` is optional. Integration uses OpenAI-compatible model discovery and streamed chat completions at the configured URL. Other engine labels, including SGLang, TensorRT-LLM, Triton, llama.cpp, Ollama, and TGI, require endpoints that implement that protocol. Native engine APIs and universal exporter coverage are deferred.
+
+For an authenticated endpoint, set `INFERENCE_API_KEY` in the environment of each GPUP process that connects to it and add `--api-key-env INFERENCE_API_KEY` when registering the target. GPUP stores the variable name; it resolves the key from the environment and does not persist its value. Target commands accept the registered name or ID.
+
+## Inspect requests and GPUs
+
+```sh
 ./bin/gpup requests
 ./bin/gpup gpu
 ./bin/gpup top
@@ -27,40 +43,80 @@ Open `http://127.0.0.1:7331`. The database defaults to the user configuration di
 ./bin/gpup doctor
 ```
 
-For an authenticated inference endpoint, add `--api-key-env INFERENCE_API_KEY` and set that environment variable. Keys are resolved from the environment rather than persisted in SQLite. Target commands use the target ID or name shown by the CLI.
+`top` opens the interactive terminal dashboard. `discover` finds and registers compatible local endpoints. `doctor` checks the local setup. Add `--json` to inspection commands for machine-readable output.
+
+Request metadata covers GPUP-generated requests, with up to 2,000 visible rows. It does not capture all traffic received by an inference server. Local GPU telemetry is not automatically attributed to a remote target. Missing or unsupported measurements stay unavailable; opt-in demo data is visibly labeled.
+
+## Benchmark and compare
+
+Run the same workload before and after a change to your inference server:
 
 ```sh
 ./bin/gpup bench local --model my-model --concurrency 1,2,4 \
   --duration 30s --max-tokens 128 --prompt 'Explain GPU memory bandwidth.' --save baseline
+
 ./bin/gpup bench local --model my-model --concurrency 1,2,4 \
   --duration 30s --max-tokens 128 --prompt 'Explain GPU memory bandwidth.' \
   --save optimized --compare baseline --max-throughput-drop 10 --max-latency-increase 20
+```
+
+`--duration` applies to each concurrency point. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
+
+You can also sweep concurrency, capture passive telemetry, or compare existing runs:
+
+```sh
 ./bin/gpup sweep local --model my-model --concurrency 1,2,4 --duration 30s
 ./bin/gpup profile local --duration 30s
 ./bin/gpup compare BASELINE_RUN_ID CANDIDATE_RUN_ID
 ```
 
-`sweep` varies request concurrency; it does not change engine configuration. `profile` passively samples observations. Benchmark prompts are sent to the selected inference server but are not stored in the database. Check `gpup COMMAND --help` for current flags and comparison threshold units.
+`sweep` varies client concurrency without changing engine configuration. `profile` samples observations without generating a benchmark workload. Prompts are sent to the selected inference server but are not stored in the database.
 
-For CI, add `--compare baseline --fail-if 'throughput<-5%' --fail-if 'ttft-p99>+10%'`. Failed workloads and incompatible runs cannot pass comparison. Throughput gates prefer reported output tokens/sec and explicitly fall back to requests/sec when usage is unavailable. Latency percentiles use at most 10,000 uniformly sampled successes per point; mean and maximum remain exact. Each point records whether sampling occurred.
+For CI, add `--compare baseline --fail-if 'throughput<-5%' --fail-if 'ttft-p99>+10%'` to a matching benchmark command. Throughput gates prefer reported output tokens/sec and explicitly fall back to requests/sec when usage is unavailable. Latency percentiles use at most 10,000 uniformly sampled successful requests per point; mean and maximum remain exact, and each point records whether sampling occurred. See [metric semantics](docs/metrics.md) for timing definitions and measurement limits.
 
-The CLI and daemon share SQLite. An already running daemon picks up target registration and completed CLI runs on its next collection cycle. Request metadata is bounded to 2,000 visible rows; it describes GPUP-generated requests, not every request received by an inference server. Local GPU telemetry is not automatically attributed to a remote target.
+Use `./bin/gpup COMMAND --help` for command options.
 
-## Network access and collection
+## Configuration and remote access
 
-The default listener is loopback. For a remote listener, set `GPUP_API_TOKEN` and supply `--tls-cert` and `--tls-key` for TLS. Clients send `Authorization: Bearer TOKEN`. The dashboard offers a token input. `--read-only` disables mutating API operations. Avoid placing the token in command history; `--token` is available when required by an existing launcher. Reverse proxies must preserve Host and use HTTPS to the TLS-enabled backend so strict origin checks remain valid.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `--db PATH` | User configuration directory's `gpup/gpup.db` | SQLite storage shared by the CLI and server |
+| `serve --listen ADDRESS` | `127.0.0.1:7331` | Dashboard and API bind address |
+| `GPUP_API_TOKEN` | Unset | API authentication; required for non-loopback binding |
+| `serve --tls-cert PATH` / `--tls-key PATH` | Unset | Enable HTTPS; supply both files |
+| `serve --read-only` | Disabled | Disable mutating API operations |
+| `--dcgm-url URL` / `GPUP_DCGM_URL` | Unset | Optional DCGM exporter endpoint |
+
+Use the same `--db` path for CLI commands and the server when overriding storage. A running server picks up target registrations and completed CLI runs on its next collection cycle.
+
+For remote access, set `GPUP_API_TOKEN` and enable TLS with your certificate and private key:
 
 ```sh
 export GPUP_API_TOKEN='your-generated-secret'
 ./bin/gpup serve --listen 0.0.0.0:7331 --db /data/gpup.db \
+  --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem \
   --dcgm-url http://127.0.0.1:9400/metrics
 ```
 
+API clients send `Authorization: Bearer TOKEN`; the dashboard provides a token input. Inject the token through your environment or secret manager to avoid storing it in command history. `--token` is also available for existing launchers. Reverse proxies must preserve Host and use HTTPS to the TLS-enabled backend so origin checks remain valid.
+
+## GPU collection
+
 NVML collection requires a cgo build and a usable NVIDIA driver. Builds with `CGO_ENABLED=0`, including the supplied Docker image, use `nvidia-smi` fallback when that executable is available. Optional DCGM scraping supplements identified local devices; it is not distributed device discovery. Unsupported readings stay unavailable. Containers need NVIDIA Container Toolkit and appropriate device/utility access to collect GPU measurements. Inference targets can still be monitored without a local GPU.
 
-## Development and deployment
+## Development
 
-`make test` builds the frontend and runs Go/frontend tests. `make check` adds Go vet and race checks. Start `gpup serve` and `make dev` in separate terminals for frontend development; Vite proxies API traffic to the local server.
+| Command | What it does |
+| --- | --- |
+| `make build` | Install frontend dependencies, build the dashboard, and compile `bin/gpup` |
+| `make test` | Build the frontend and run Go and frontend tests |
+| `make check` | Build the frontend, run Go vet and race tests, and run frontend tests |
+| `make dev` | Start the Vite development server |
+| `make docker` | Build the `gpup:local` Docker image |
+
+For frontend development, run `./bin/gpup serve` and `make dev` in separate terminals after building. Open the URL printed by Vite; it proxies `/api` requests to `http://127.0.0.1:7331`.
+
+## Deployment
 
 Packaging examples live under [deploy](deploy): Docker/Compose, a Helm chart, and a loopback systemd service. Compose publishes only to host loopback and keeps SQLite in a named volume. Set `GPUP_API_TOKEN` before starting it:
 
@@ -68,4 +124,12 @@ Packaging examples live under [deploy](deploy): Docker/Compose, a Helm chart, an
 docker compose -f deploy/docker/compose.yaml up --build
 ```
 
-See [metric semantics](docs/metrics.md), [scope and roadmap](docs/roadmap.md), and the [MVP design](docs/superpowers/specs/2026-10-04-gpup-mvp-design.md). Hardware accuracy and collection overhead require validation on actual GPUs; deployment examples do not imply production certification.
+The dashboard requires the configured token. GPU collection in containers requires additional NVIDIA device access; see [GPU collection](#gpu-collection).
+
+## Scope and further reading
+
+GPUP currently runs as a single local instance. Distributed collectors, cluster-wide aggregation, remote GPU discovery, multiuser RBAC/OIDC, automatic engine tuning, and AMD/Intel GPU support are deferred. Hardware accuracy and collection overhead require validation on actual GPUs; deployment examples do not imply production certification.
+
+- [Metric semantics](docs/metrics.md): timing definitions, telemetry sources, and measurement limits
+- [Scope and roadmap](docs/roadmap.md): implemented capabilities and deferred work
+- [MVP design](docs/superpowers/specs/2026-10-04-gpup-mvp-design.md): architecture and behavior
