@@ -1,0 +1,9 @@
+bin/
+web/node_modules/
+web/test-results/
+*.db
+*.db-shm
+*.db-wal
+.env
+coverage.out
+artifacts/

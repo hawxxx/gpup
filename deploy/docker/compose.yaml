@@ -1,0 +1,17 @@
+services:
+  gpup:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: gpup:local
+    ports:
+      - "127.0.0.1:7331:7331"
+    environment:
+      GPUP_API_TOKEN: ${GPUP_API_TOKEN:?Set GPUP_API_TOKEN before starting GPUP}
+    volumes:
+      - gpup-data:/data
+    restart: unless-stopped
+    # Enable NVIDIA access only when the host has NVIDIA Container Toolkit:
+    # gpus: all
+volumes:
+  gpup-data:

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: gpup
+description: Single GPUP instance with local SQLite storage
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

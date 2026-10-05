@@ -1,0 +1,16 @@
+image:
+  repository: gpup
+  tag: local
+  pullPolicy: IfNotPresent
+tokenSecret:
+  name: gpup-token
+  key: token
+service:
+  port: 7331
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""
+dcgmURL: ""
+readOnly: false
+resources: {}
