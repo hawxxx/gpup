@@ -5,7 +5,7 @@ import type { Snapshot } from './domain';
 export function OverviewGuide({ snapshot }: { snapshot: Snapshot }) {
   const completed = snapshot.runs.filter(run => run.status === 'complete').length;
   return <section className="overview-guide" aria-label="Performance workflow">
-    <div className="workflow-heading"><span className="workflow-icon"><ScanLine size={18} /></span><div><h2>Turn measurements into decisions</h2><p>Connect an engine, find its operating point, then compare the next change.</p></div><span className="badge">{completed} completed runs</span></div>
+    <div className="workflow-heading"><span className="workflow-icon"><ScanLine size={18} /></span><div><h2>Turn measurements into decisions</h2><p>Connect an engine, find its operating point, then compare the next change.</p></div><span className="badge">{completed} completed run{completed === 1 ? '' : 's'}</span></div>
     <ol className="workflow-steps">
       <li><Link to="/system"><span className="step-number">{snapshot.targets.length ? <Check size={13} /> : '01'}</span><span>Connect<span className="step-caption">Configure an endpoint</span></span><ArrowRight size={14} /></Link></li>
       <li><Link to="/benchmarks"><span className="step-number">02</span><span>Benchmark<span className="step-caption">Find the concurrency knee</span></span><ArrowRight size={14} /></Link></li>
