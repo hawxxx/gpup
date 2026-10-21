@@ -44,6 +44,8 @@ type Snapshot struct {
 	CollectorErrors []string        `json:"collectorErrors"`
 	Metrics         map[string]any  `json:"metrics"`
 	System          map[string]any  `json:"system"`
+	// ActiveJobs reports progress for benchmarks that have not finished.
+	ActiveJobs []Job `json:"activeJobs"`
 }
 type Job struct {
 	ID       string       `json:"id"`
@@ -58,6 +60,9 @@ type JobProgress struct {
 	Concurrency int `json:"concurrency"`
 	Requests    int `json:"requests"`
 	Errors      int `json:"errors"`
+	// Point is the 1-based index of the active concurrency point out of Points.
+	Point  int `json:"point"`
+	Points int `json:"points"`
 }
 type GPUSample struct {
 	Time  time.Time `json:"time"`
@@ -127,6 +132,17 @@ func New(path, dcgmURL string) (*App, error) {
 			}
 		}
 	}
+	// Restore recent chart history so a restart does not blank the overview.
+	if rows, e := s.Snapshots(600); e == nil {
+		for i := len(rows) - 1; i >= 0; i-- {
+			var stored struct {
+				Point SnapshotPoint `json:"point"`
+			}
+			if json.Unmarshal(rows[i], &stored) == nil && !stored.Point.Time.IsZero() {
+				a.state.History = append(a.state.History, stored.Point)
+			}
+		}
+	}
 	sort.Slice(a.state.Requests, func(i, j int) bool { return a.state.Requests[i].StartedAt.Before(a.state.Requests[j].StartedAt) })
 	if len(a.state.Requests) > 2000 {
 		a.state.Requests = a.state.Requests[len(a.state.Requests)-2000:]
@@ -165,6 +181,16 @@ func (a *App) Snapshot() Snapshot {
 	b, _ := json.Marshal(a.state)
 	var s Snapshot
 	_ = json.Unmarshal(b, &s)
+	s.ActiveJobs = []Job{}
+	for _, j := range a.jobs {
+		if j.Status == "running" {
+			if j.Progress != nil {
+				p := *j.Progress
+				j.Progress = &p
+			}
+			s.ActiveJobs = append(s.ActiveJobs, j)
+		}
+	}
 	return s
 }
 func (a *App) Revision() uint64 { a.mu.RLock(); defer a.mu.RUnlock(); return a.revision }
@@ -258,6 +284,37 @@ func (a *App) Run(id string) (bench.Run, error) {
 	}
 	return bench.Run{}, storage.ErrNotFound
 }
+
+// DeleteRun removes a stored run and its request metadata. Running jobs must be
+// cancelled first so their results cannot be persisted after deletion.
+func (a *App) DeleteRun(id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	index := -1
+	for i, r := range a.state.Runs {
+		if r.ID == id || (r.Name != "" && r.Name == id) {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		return storage.ErrNotFound
+	}
+	run := a.state.Runs[index]
+	if _, active := a.cancels[run.ID]; active {
+		return errors.New("cancel the running benchmark before deleting it")
+	}
+	if err := a.store.Delete("run", run.ID); err != nil {
+		return err
+	}
+	if err := a.store.Delete("requests", run.ID); err != nil {
+		return err
+	}
+	a.state.Runs = append(a.state.Runs[:index:index], a.state.Runs[index+1:]...)
+	delete(a.jobs, run.ID)
+	a.revision++
+	return nil
+}
 func (a *App) Job(id string) (Job, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -322,7 +379,7 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 	id := ID("run")
 	ctx, cancel := context.WithCancel(a.ctx)
 	a.cancels[id] = cancel
-	a.jobs[id] = Job{ID: id, Status: "running", Progress: &JobProgress{Concurrency: c.Concurrency[0]}}
+	a.jobs[id] = Job{ID: id, Status: "running", Progress: &JobProgress{Concurrency: c.Concurrency[0], Point: 1, Points: len(c.Concurrency)}}
 	safeConfig := c
 	safeConfig.Prompt = ""
 	a.state.Runs = append([]bench.Run{{ID: id, Name: c.Name, TargetID: t.ID, Model: c.Model, StartedAt: time.Now(), Status: "running", Config: safeConfig, Points: []bench.Point{}, Findings: []bench.Finding{}}}, a.state.Runs...)
@@ -338,7 +395,12 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 			if j, ok := a.jobs[id]; ok && j.Progress != nil {
 				p := *j.Progress
 				if r.Concurrency != p.Concurrency {
-					p = JobProgress{Concurrency: r.Concurrency}
+					p = JobProgress{Concurrency: r.Concurrency, Point: p.Point, Points: p.Points}
+					for i, n := range c.Concurrency {
+						if n == r.Concurrency {
+							p.Point = i + 1
+						}
+					}
 				}
 				p.Requests++
 				if r.Status != "ok" {
@@ -492,47 +554,44 @@ func (a *App) Poll(ctx context.Context) {
 			observation.Throttled = append(observation.Throttled, *g.Throttled)
 		}
 	}
+	// Probe targets concurrently so unreachable endpoints cannot stretch a poll
+	// beyond the collection interval; results merge in configuration order.
+	probes := make([]targetProbe, len(targets))
+	var probeGroup sync.WaitGroup
+	limit := make(chan struct{}, 8)
+	for i := range targets {
+		probeGroup.Add(1)
+		go func(i int) {
+			defer probeGroup.Done()
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			probes[i] = probeTarget(ctx, targets[i])
+		}(i)
+	}
+	probeGroup.Wait()
+	if ctx.Err() != nil {
+		return
+	}
 	for i, t := range targets {
-		if ctx.Err() != nil {
-			return
-		}
-		c, e := engine.New(t)
-		if e != nil {
-			targets[i].Status = "error"
-			targets[i].Error = e.Error()
-			continue
-		}
-		pollCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		ms, e := c.Discover(pollCtx)
-		cancel()
-		if e != nil {
-			targets[i].Status = "unreachable"
-			targets[i].Error = e.Error()
-		} else {
-			targets[i].Status = "healthy"
-			targets[i].Error = ""
-			models = append(models, ms...)
-		}
-		if t.MetricsURL != "" {
-			pollCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
-			values, e := c.Scrape(pollCtx)
-			cancel()
-			if e != nil {
-				errs = append(errs, t.Name+": "+e.Error())
-			} else {
-				metrics[t.ID] = values
-				for k, v := range values {
-					val := v.Value
-					// With several targets, history reports the most pressured one.
-					switch k {
-					case "kvCacheFraction":
-						val *= 100
-						observation.KVCachePercent = maxValue(observation.KVCachePercent, val)
-					case "requestsWaiting":
-						observation.RequestsWaiting = maxValue(observation.RequestsWaiting, val)
-					case "preemptionsTotal":
-						observation.Evictions = maxValue(observation.Evictions, val)
-					}
+		probe := probes[i]
+		targets[i].Status = probe.status
+		targets[i].Error = probe.err
+		models = append(models, probe.models...)
+		if probe.metricsErr != nil {
+			errs = append(errs, t.Name+": "+probe.metricsErr.Error())
+		} else if probe.metrics != nil {
+			metrics[t.ID] = probe.metrics
+			for k, v := range probe.metrics {
+				val := v.Value
+				// With several targets, history reports the most pressured one.
+				switch k {
+				case "kvCacheFraction":
+					val *= 100
+					observation.KVCachePercent = maxValue(observation.KVCachePercent, val)
+				case "requestsWaiting":
+					observation.RequestsWaiting = maxValue(observation.RequestsWaiting, val)
+				case "preemptionsTotal":
+					observation.Evictions = maxValue(observation.Evictions, val)
 				}
 			}
 		}
@@ -607,6 +666,35 @@ func (a *App) Poll(ctx context.Context) {
 	a.mu.Unlock()
 	_ = a.store.AddSnapshot(point.Time, map[string]any{"point": point, "gpus": devices, "metrics": metrics})
 	_ = a.store.Prune(24*time.Hour, 200)
+}
+
+type targetProbe struct {
+	status, err string
+	models      []engine.Model
+	metrics     map[string]engine.Metric
+	metricsErr  error
+}
+
+func probeTarget(ctx context.Context, t engine.Target) targetProbe {
+	c, e := engine.New(t)
+	if e != nil {
+		return targetProbe{status: "error", err: e.Error()}
+	}
+	out := targetProbe{status: "healthy"}
+	pollCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	ms, e := c.Discover(pollCtx)
+	cancel()
+	if e != nil {
+		out.status, out.err = "unreachable", e.Error()
+	} else {
+		out.models = ms
+	}
+	if t.MetricsURL != "" {
+		pollCtx, cancel = context.WithTimeout(ctx, 2*time.Second)
+		out.metrics, out.metricsErr = c.Scrape(pollCtx)
+		cancel()
+	}
+	return out
 }
 
 func maxValue(current *float64, v float64) *float64 {
@@ -754,7 +842,7 @@ func (a *App) Discover(ctx context.Context) ([]engine.Target, error) {
 	candidates := []struct {
 		engine string
 		port   int
-	}{{"vllm", 8000}, {"sglang", 30000}, {"ollama", 11434}, {"llama.cpp", 8080}, {"triton", 8001}}
+	}{{"vllm", 8000}, {"sglang", 30000}, {"ollama", 11434}, {"llama.cpp", 8080}, {"lm-studio", 1234}, {"triton", 9000}}
 	found := []engine.Target{}
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {
@@ -776,6 +864,16 @@ func (a *App) Discover(ctx context.Context) ([]engine.Target, error) {
 		t := engine.Target{Name: name, Engine: "openai", URL: endpoint}
 		if len(models) > 0 {
 			t.Model = models[0].ID
+		}
+		// Register the exporter only when it serves a recognized engine series.
+		metricsURL := fmt.Sprintf("http://127.0.0.1:%d/metrics", candidate.port)
+		if mc, err := engine.New(engine.Target{Engine: "openai", URL: endpoint, MetricsURL: metricsURL}); err == nil {
+			probe, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			values, err := mc.Scrape(probe)
+			cancel()
+			if err == nil && len(values) > 0 {
+				t.MetricsURL = metricsURL
+			}
 		}
 		t, err = a.AddTarget(ctx, t)
 		if err != nil {

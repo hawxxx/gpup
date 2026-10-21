@@ -39,6 +39,28 @@ func Handler(a *app.App, assets fs.FS, opt Options) http.Handler {
 				fmt.Fprintf(w, "gpup_target_up{target=\"%s\"} %d\n", promLabel(t.Name), up)
 			}
 		}
+		// Normalized engine exporter readings, one series per target and reading.
+		engineGauges := []struct{ key, name, help string }{
+			{"requestsRunning", "gpup_target_requests_running", "Requests running on the inference engine."},
+			{"requestsWaiting", "gpup_target_requests_waiting", "Requests queued by the inference engine."},
+			{"kvCacheFraction", "gpup_target_kv_cache_usage_ratio", "Inference engine KV cache usage ratio (0-1)."},
+		}
+		for _, gauge := range engineGauges {
+			header := false
+			for _, t := range s.Targets {
+				values, _ := s.Metrics[t.ID].(map[string]any)
+				reading, _ := values[gauge.key].(map[string]any)
+				v, ok := reading["value"].(float64)
+				if !ok {
+					continue
+				}
+				if !header {
+					fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", gauge.name, gauge.help, gauge.name)
+					header = true
+				}
+				fmt.Fprintf(w, "%s{target=\"%s\"} %g\n", gauge.name, promLabel(t.Name), v)
+			}
+		}
 		gauges := []struct {
 			name, help string
 			value      func(gpu.GPU) *float64
@@ -138,6 +160,17 @@ func Handler(a *app.App, assets fs.FS, opt Options) http.Handler {
 		api.Delete("/benchmarks/{id}", func(w http.ResponseWriter, r *http.Request) {
 			if err := a.CancelJob(chi.URLParam(r, "id")); err != nil {
 				fail(w, 404, err)
+				return
+			}
+			w.WriteHeader(204)
+		})
+		api.Delete("/runs/{id}", func(w http.ResponseWriter, r *http.Request) {
+			if err := a.DeleteRun(chi.URLParam(r, "id")); err != nil {
+				status := 400
+				if errors.Is(err, storage.ErrNotFound) {
+					status = 404
+				}
+				fail(w, status, err)
 				return
 			}
 			w.WriteHeader(204)

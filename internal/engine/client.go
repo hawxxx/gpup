@@ -242,6 +242,10 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 			Choices []struct {
 				Delta struct {
 					Content string `json:"content"`
+					// Reasoning models stream thinking tokens separately; they are
+					// generated output and must count toward TTFT and TPOT.
+					ReasoningContent string `json:"reasoning_content"`
+					Reasoning        string `json:"reasoning"`
 				} `json:"delta"`
 			} `json:"choices"`
 			Usage *struct {
@@ -254,6 +258,9 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 			return result, fmt.Errorf("malformed SSE JSON: %w", e)
 		}
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
+			if detail := errorDetail(strings.NewReader(`{"error":` + string(chunk.Error) + `}`)); detail != "" {
+				return result, fmt.Errorf("engine returned stream error: %s", detail)
+			}
 			return result, errors.New("engine returned stream error")
 		}
 		if chunk.Usage != nil {
@@ -265,7 +272,7 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 			}
 		}
 		for _, choice := range chunk.Choices {
-			if choice.Delta.Content == "" {
+			if choice.Delta.Content == "" && choice.Delta.ReasoningContent == "" && choice.Delta.Reasoning == "" {
 				continue
 			}
 			now := time.Now()
@@ -293,6 +300,22 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 	}
 	return result, nil
 }
+
+// exporterNames maps engine exporter series to normalized metric keys. Engines
+// expose the same concepts under different names; unknown series are ignored.
+var exporterNames = map[string]string{
+	"vllm:num_requests_running": "requestsRunning", "vllm:num_requests_waiting": "requestsWaiting",
+	"vllm:gpu_cache_usage_perc": "kvCacheFraction", "vllm:kv_cache_usage_perc": "kvCacheFraction",
+	"vllm:prompt_tokens_total": "inputTokensTotal", "vllm:generation_tokens_total": "outputTokensTotal",
+	"vllm:num_preemptions_total": "preemptionsTotal",
+	"sglang:num_running_reqs":    "requestsRunning", "sglang:num_queue_reqs": "requestsWaiting",
+	"sglang:token_usage": "kvCacheFraction", "sglang:prompt_tokens_total": "inputTokensTotal",
+	"sglang:generation_tokens_total": "outputTokensTotal",
+	"llamacpp:requests_processing":   "requestsRunning", "llamacpp:requests_deferred": "requestsWaiting",
+	"llamacpp:prompt_tokens_total": "inputTokensTotal", "llamacpp:tokens_predicted_total": "outputTokensTotal",
+	"tgi_batch_current_size": "requestsRunning", "tgi_queue_size": "requestsWaiting",
+}
+
 func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 	out := map[string]Metric{}
 	if c.Target.MetricsURL == "" {
@@ -305,7 +328,6 @@ func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 		return out, e
 	}
 	defer resp.Body.Close()
-	names := map[string]string{"vllm:num_requests_running": "requestsRunning", "vllm:num_requests_waiting": "requestsWaiting", "vllm:gpu_cache_usage_perc": "kvCacheFraction", "vllm:kv_cache_usage_perc": "kvCacheFraction", "vllm:prompt_tokens_total": "inputTokensTotal", "vllm:generation_tokens_total": "outputTokensTotal", "vllm:num_preemptions_total": "preemptionsTotal"}
 	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4<<20))
 	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
@@ -313,7 +335,7 @@ func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 		if !ok {
 			continue
 		}
-		normalized, ok := names[sample.Name]
+		normalized, ok := exporterNames[sample.Name]
 		if !ok {
 			continue
 		}

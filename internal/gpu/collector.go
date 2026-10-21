@@ -108,7 +108,49 @@ func collectSMI(ctx context.Context) ([]GPU, error) {
 	if err != nil {
 		return nil, err
 	}
-	return parseSMI(string(out))
+	devices, err := parseSMI(string(out))
+	if err != nil {
+		return nil, err
+	}
+	// Clock event reasons are queried separately: older drivers reject the newer
+	// field name, and an unsupported field must not discard the base readings.
+	for _, field := range []string{"clocks_event_reasons.active", "clocks_throttle_reasons.active"} {
+		reasons, err := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=index,"+field, "--format=csv,noheader,nounits").Output()
+		if err == nil {
+			applyThrottleReasons(string(reasons), devices)
+			break
+		}
+	}
+	return devices, nil
+}
+
+// applyThrottleReasons marks devices throttled when any reason other than idle
+// is active, matching the NVML collector. Unparseable rows stay unavailable.
+func applyThrottleReasons(input string, devices []GPU) {
+	rows, err := csv.NewReader(strings.NewReader(input)).ReadAll()
+	if err != nil {
+		return
+	}
+	const gpuIdle = 0x1
+	for _, row := range rows {
+		if len(row) != 2 {
+			continue
+		}
+		index, err := strconv.Atoi(strings.TrimSpace(row[0]))
+		if err != nil {
+			continue
+		}
+		mask, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimSpace(row[1]), "0x"), 16, 64)
+		if err != nil {
+			continue
+		}
+		for i := range devices {
+			if devices[i].Index == index {
+				active := mask&^gpuIdle != 0
+				devices[i].Throttled = &active
+			}
+		}
+	}
 }
 func parseSMI(input string) ([]GPU, error) {
 	rows, err := csv.NewReader(strings.NewReader(input)).ReadAll()
