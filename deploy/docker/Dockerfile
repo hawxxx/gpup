@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build stages run on the native builder platform and cross-compile, so multi-arch release builds avoid emulation.
-FROM --platform=$BUILDPLATFORM node:22-alpine AS frontend
+FROM --platform=$BUILDPLATFORM node:26-alpine AS frontend
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci
