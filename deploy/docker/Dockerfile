@@ -16,7 +16,7 @@ COPY . .
 COPY --from=frontend /src/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags='-s -w' -o /gpup ./cmd/gpup
 
-FROM alpine:3.22
+FROM alpine:3.24
 LABEL org.opencontainers.image.source="https://github.com/hawxxx/gpup"
 RUN apk add --no-cache ca-certificates && addgroup -g 10001 gpup && adduser -D -u 10001 -G gpup gpup && mkdir /data && chown gpup:gpup /data
 COPY --from=backend /gpup /usr/local/bin/gpup
