@@ -137,6 +137,9 @@ func TestRunningJobAppearsInSnapshotAndCanCancel(t *testing.T) {
 	if len(s.Runs) != 1 || s.Runs[0].ID != id || s.Runs[0].Status != "running" || s.Runs[0].Config.Prompt != "" {
 		t.Fatalf("active run missing or private: %+v", s.Runs)
 	}
+	if len(s.ActiveJobs) != 1 || s.ActiveJobs[0].ID != id || s.ActiveJobs[0].Progress == nil || s.ActiveJobs[0].Progress.Points != 1 {
+		t.Fatalf("active job progress missing: %+v", s.ActiveJobs)
+	}
 	if err = a.CancelJob(id); err != nil {
 		t.Fatal(err)
 	}
@@ -178,5 +181,89 @@ func TestRunningDaemonSeesOtherCLIProcessWrites(t *testing.T) {
 	s := daemon.Snapshot()
 	if len(s.Targets) != 1 || len(s.Runs) != 1 || len(s.Requests) != 1 {
 		t.Fatalf("cached daemon missed CLI writes: targets=%d runs=%d requests=%d", len(s.Targets), len(s.Runs), len(s.Requests))
+	}
+}
+
+func TestPollProbesTargetsConcurrently(t *testing.T) {
+	release := make(chan struct{})
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer slow.Close()
+	defer close(release)
+	a, err := New(filepath.Join(t.TempDir(), "gpup.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	for i := 0; i < 4; i++ {
+		if _, err := a.AddTarget(context.Background(), engine.Target{Name: fmt.Sprintf("slow-%d", i), URL: slow.URL}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Now()
+	a.Poll(context.Background())
+	// Sequential probes would take at least 4 x 2s discovery timeouts.
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("poll took %s; targets were probed sequentially", elapsed)
+	}
+	for _, target := range a.Snapshot().Targets {
+		if target.Status != "unreachable" {
+			t.Fatalf("slow target status %q, want unreachable", target.Status)
+		}
+	}
+}
+
+func TestDeleteRunRemovesStoredRunAndRequests(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gpup.db")
+	a, err := New(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	run := bench.Run{ID: "run-1", Name: "baseline", Status: "complete", StartedAt: time.Now(), Points: []bench.Point{}, Findings: []bench.Finding{}}
+	if err = a.store.Put("run", run.ID, run); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.store.Put("requests", run.ID, []engine.Result{{ID: "r1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.refreshStoredData(); err != nil {
+		t.Fatal(err)
+	}
+	if err = a.DeleteRun("baseline"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = a.Run("run-1"); err == nil {
+		t.Fatal("deleted run still listed")
+	}
+	if rows, _ := a.store.List("requests", 10); len(rows) != 0 {
+		t.Fatal("request metadata survived run deletion")
+	}
+	if err = a.DeleteRun("run-1"); err == nil {
+		t.Fatal("deleting a missing run succeeded")
+	}
+}
+
+func TestHistorySurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gpup.db")
+	a, err := New(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Poll(context.Background())
+	a.Poll(context.Background())
+	want := len(a.Snapshot().History)
+	a.Close()
+	b, err := New(path, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	if got := len(b.Snapshot().History); want == 0 || got != want {
+		t.Fatalf("restored %d history points, want %d", got, want)
 	}
 }

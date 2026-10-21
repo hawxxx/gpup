@@ -4,6 +4,10 @@ GPUP is a local inference observability and benchmarking tool for OpenAI-compati
 
 A single Go executable serves the dashboard and stores targets, request metadata, and runs in SQLite. The original `index.html` is a separate, simulated visual prototype; use the executable for the live application.
 
+![GPUP overview: live output throughput, time to first token, and KV-cache usage](docs/screenshots/overview.png)
+
+See [Screenshots](#screenshots) for each dashboard view.
+
 ## Quick start
 
 Building from source requires Go 1.22 or newer, Node.js 22 with npm, and Make. Native NVML collection also requires a C compiler and a usable NVIDIA driver; the driver library is loaded at runtime. Node.js is only needed to build or develop the frontend.
@@ -43,7 +47,7 @@ For an authenticated endpoint, set `INFERENCE_API_KEY` in the environment of eac
 ./bin/gpup doctor
 ```
 
-`top` opens the interactive terminal dashboard. `discover` finds and registers compatible local endpoints. `doctor` checks the local setup. Add `--json` to inspection commands for machine-readable output.
+`top` opens the interactive terminal dashboard. `discover` probes common local ports (vLLM 8000, SGLang 30000, Ollama 11434, llama.cpp 8080, LM Studio 1234, Triton's OpenAI frontend 9000), registers compatible endpoints, and adds their `/metrics` URL when it serves recognized engine metrics. `doctor` checks the local setup. Add `--json` to inspection commands for machine-readable output.
 
 Request metadata covers GPUP-generated requests, with up to 2,000 visible rows. It does not capture all traffic received by an inference server. Local GPU telemetry is not automatically attributed to a remote target. Missing or unsupported measurements stay unavailable; opt-in demo data is visibly labeled.
 
@@ -60,7 +64,7 @@ Run the same workload before and after a change to your inference server:
   --save optimized --compare baseline --max-throughput-drop 10 --max-latency-increase 20
 ```
 
-`--duration` applies to each concurrency point. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
+`--duration` applies to each concurrency point. Add `--warmup 10s` to send unmeasured traffic before each point so connection setup and cold caches do not skew results; warm-up settings must match for runs to be comparable. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
 
 You can also sweep concurrency, capture passive telemetry, or compare existing runs:
 
@@ -74,7 +78,56 @@ You can also sweep concurrency, capture passive telemetry, or compare existing r
 
 For CI, add `--compare baseline --fail-if 'throughput<-5%' --fail-if 'ttft-p99>+10%'` to a matching benchmark command. Throughput gates prefer reported output tokens/sec and explicitly fall back to requests/sec when usage is unavailable. Latency percentiles use at most 10,000 uniformly sampled successful requests per point; mean and maximum remain exact, and each point records whether sampling occurred. See [metric semantics](docs/metrics.md) for timing definitions and measurement limits.
 
+Manage saved runs from the CLI or the dashboard's Benchmarks page:
+
+```sh
+./bin/gpup runs
+./bin/gpup runs export baseline --format csv > baseline.csv
+./bin/gpup runs delete OLD_RUN_ID
+```
+
+Run names resolve to the most recent run with that name. Deleting a run also deletes its stored request metadata.
+
 Use `./bin/gpup COMMAND --help` for command options.
+
+## Screenshots
+
+These captures use the synthetic endpoint in [`benchmarks/fixture`](benchmarks/fixture/main.go), which simulates a server with limited batch capacity and a vLLM-style exporter. Its timings demonstrate the interface; they are not inference engine measurements. GPU telemetry comes from a real local RTX 5090 read through NVML.
+
+**Overview.** Live output throughput, time to first token, and KV-cache usage from the engine exporter, alongside local GPUs, recent runs, and the newest requests.
+
+![Overview page](docs/screenshots/overview.png)
+
+**Benchmarks.** Each run shows throughput by concurrency, the detected knee (highlighted row), and TTFT, TPOT, chunk-gap (ITL), and E2E percentiles. Completed runs can be exported as CSV or JSON or deleted; running runs show point-by-point progress.
+
+![Benchmarks page](docs/screenshots/benchmarks.png)
+
+**Experiments.** Compare two compatible runs point by point. Here, the candidate fixture had twice the batch capacity of the baseline.
+
+![Experiments comparison](docs/screenshots/experiments.png)
+
+**Requests.** A virtualized, sortable, filterable trace of GPUP-generated requests, newest first.
+
+![Request trace](docs/screenshots/requests.png)
+
+**Models.** Discovered models per target, with engine-reported running and waiting requests and KV-cache usage when a metrics URL is configured.
+
+![Model registry](docs/screenshots/models.png)
+
+**GPUs.** Local device telemetry from NVML, nvidia-smi, or DCGM supplements. Unsupported readings display as —.
+
+![GPU telemetry](docs/screenshots/gpus.png)
+
+**System.** Runtime configuration, collector health, and target management.
+
+![System page](docs/screenshots/system.png)
+
+The dashboard follows the system color scheme, remembers your choice, and adapts to narrow screens.
+
+<p>
+  <img src="docs/screenshots/overview-light.png" alt="Overview in light appearance" width="68%">
+  <img src="docs/screenshots/mobile-benchmarks.png" alt="Benchmarks on a 390-pixel-wide screen" width="28%">
+</p>
 
 ## Configuration and remote access
 
@@ -219,4 +272,5 @@ GPUP currently runs as a single local instance. Distributed collectors, cluster-
 
 - [Metric semantics](docs/metrics.md): timing definitions, telemetry sources, and measurement limits
 - [Scope and roadmap](docs/roadmap.md): implemented capabilities and deferred work
+- [Robustness and feature gaps](docs/research/2026-10-21-robustness-and-feature-gaps.md): fixes from the October 2026 review and ranked next steps
 - [MVP design](docs/superpowers/specs/2026-10-04-gpup-mvp-design.md): architecture and behavior

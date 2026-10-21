@@ -22,12 +22,18 @@ type Config struct {
 	Concurrency     []int   `json:"concurrency"`
 	DurationSeconds float64 `json:"durationSeconds"`
 	MaxTokens       int     `json:"maxTokens"`
-	Name            string  `json:"name,omitempty"`
+	// WarmupSeconds runs traffic at each point before measurement starts.
+	// Warm-up requests are visible live but excluded from point statistics.
+	WarmupSeconds float64 `json:"warmupSeconds,omitempty"`
+	Name          string  `json:"name,omitempty"`
 }
 
 func (c Config) Validate() error {
 	if c.DurationSeconds <= 0 || c.DurationSeconds > 3600 || math.IsNaN(c.DurationSeconds) || math.IsInf(c.DurationSeconds, 0) {
 		return errors.New("durationSeconds must be in (0,3600]")
+	}
+	if c.WarmupSeconds < 0 || c.WarmupSeconds > 600 || math.IsNaN(c.WarmupSeconds) {
+		return errors.New("warmupSeconds must be in [0,600]")
 	}
 	if c.MaxTokens < 1 || c.MaxTokens > 1048576 {
 		return errors.New("maxTokens must be in [1,1048576]")
@@ -132,10 +138,13 @@ type Point struct {
 	OutputTokensPerSecond *float64     `json:"outputTokensPerSecond,omitempty"`
 	TTFT                  *Percentiles `json:"ttft,omitempty"`
 	TPOT                  *Percentiles `json:"tpot,omitempty"`
-	E2E                   Percentiles  `json:"e2e"`
-	GPUSamples            []any        `json:"gpuSamples,omitempty"`
-	LatencySampleCount    int          `json:"latencySampleCount"`
-	LatencySampled        bool         `json:"latencySampled"`
+	// ITL summarizes gaps between streamed content chunks. Engines may batch
+	// several tokens per chunk, so this is chunk arrival, not per-token latency.
+	ITL                *Percentiles `json:"itl,omitempty"`
+	E2E                Percentiles  `json:"e2e"`
+	GPUSamples         []any        `json:"gpuSamples,omitempty"`
+	LatencySampleCount int          `json:"latencySampleCount"`
+	LatencySampled     bool         `json:"latencySampled"`
 }
 type Run struct {
 	ID        string    `json:"id"`
@@ -170,12 +179,13 @@ func RunBenchmark(ctx context.Context, c Generator, config Config, onResult func
 			return run, e
 		}
 		p := Point{Concurrency: n}
-		begin := time.Now()
+		warmup := time.Duration(config.WarmupSeconds * float64(time.Second))
+		begin := time.Now().Add(warmup)
 		p.StartedAt = begin
-		pointCtx, cancel := context.WithTimeout(ctx, time.Duration(config.DurationSeconds*float64(time.Second)))
+		pointCtx, cancel := context.WithTimeout(ctx, warmup+time.Duration(config.DurationSeconds*float64(time.Second)))
 		var mu sync.Mutex
 		var wg sync.WaitGroup
-		ttft, tpot, e2e := newLatencyReservoir(1), newLatencyReservoir(2), newLatencyReservoir(3)
+		ttft, tpot, e2e, itl := newLatencyReservoir(1), newLatencyReservoir(2), newLatencyReservoir(3), newLatencyReservoir(4)
 		tokens := 0
 		known := true
 		for i := 0; i < n; i++ {
@@ -183,22 +193,30 @@ func RunBenchmark(ctx context.Context, c Generator, config Config, onResult func
 			go func() {
 				defer wg.Done()
 				for pointCtx.Err() == nil {
+					issued := time.Now()
 					r, e := c.Generate(pointCtx, config.Model, config.Prompt, config.MaxTokens)
 					r.Concurrency = n
 					if e != nil && pointCtx.Err() != nil {
 						return
 					}
 					mu.Lock()
-					p.Requests++
-					if e != nil {
+					// Warm-up traffic is shown live but never measured.
+					switch {
+					case issued.Before(begin):
+					case e != nil:
+						p.Requests++
 						p.Errors++
-					} else {
+					default:
+						p.Requests++
 						e2e.add(r.DurationMs)
 						if r.TTFTMs != nil {
 							ttft.add(*r.TTFTMs)
 						}
 						if r.TPOTMs != nil {
 							tpot.add(*r.TPOTMs)
+						}
+						for _, gap := range r.ChunkGapsMs {
+							itl.add(gap)
 						}
 						if r.OutputTokens == nil {
 							known = false
@@ -235,6 +253,10 @@ func RunBenchmark(ctx context.Context, c Generator, config Config, onResult func
 		if tpot.count > 0 {
 			v := tpot.summary()
 			p.TPOT = &v
+		}
+		if itl.count > 0 {
+			v := itl.summary()
+			p.ITL = &v
 		}
 		if known && e2e.count > 0 {
 			v := float64(tokens) / p.DurationSeconds

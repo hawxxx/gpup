@@ -143,3 +143,29 @@ func TestPrometheusExpositionEscapesLabels(t *testing.T) {
 		t.Fatalf("unexpected exposition:\n%s", body)
 	}
 }
+
+func TestPrometheusExpositionIncludesEngineReadings(t *testing.T) {
+	engineServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/metrics" {
+			w.Write([]byte("vllm:num_requests_waiting{model_name=\"m\"} 3\nvllm:kv_cache_usage_perc{model_name=\"m\"} 0.25\n"))
+			return
+		}
+		w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer engineServer.Close()
+	a, err := app.New(filepath.Join(t.TempDir(), "api.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err = a.AddTarget(context.Background(), engine.Target{Name: "vllm", Engine: "vllm", URL: engineServer.URL, MetricsURL: engineServer.URL + "/metrics"}); err != nil {
+		t.Fatal(err)
+	}
+	a.Poll(context.Background())
+	w := httptest.NewRecorder()
+	Handler(a, fstest.MapFS{}, Options{}).ServeHTTP(w, httptest.NewRequest("GET", "http://localhost/metrics", nil))
+	body := w.Body.String()
+	if !strings.Contains(body, `gpup_target_requests_waiting{target="vllm"} 3`) || !strings.Contains(body, `gpup_target_kv_cache_usage_ratio{target="vllm"} 0.25`) {
+		t.Fatalf("missing engine readings:\n%s", body)
+	}
+}

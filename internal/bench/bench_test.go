@@ -119,3 +119,47 @@ func TestRapidBenchmarkReportsSampling(t *testing.T) {
 		t.Fatal("exact aggregate lost")
 	}
 }
+
+type chunkedGenerator struct{}
+
+func (chunkedGenerator) Generate(ctx context.Context, model, prompt string, max int) (engine.Result, error) {
+	select {
+	case <-ctx.Done():
+		return engine.Result{}, ctx.Err()
+	case <-time.After(time.Millisecond):
+	}
+	return engine.Result{DurationMs: 1, ChunkGapsMs: []float64{2, 4}}, nil
+}
+func TestBenchmarkSummarizesChunkGaps(t *testing.T) {
+	run, err := RunBenchmark(context.Background(), chunkedGenerator{}, Config{Model: "m", Concurrency: []int{1}, DurationSeconds: 0.05, MaxTokens: 1}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	itl := run.Points[0].ITL
+	if itl == nil || itl.Max != 4 || itl.Mean != 3 {
+		t.Fatalf("chunk gaps not summarized: %+v", itl)
+	}
+}
+
+type clockGenerator struct{}
+
+func (clockGenerator) Generate(ctx context.Context, model, prompt string, max int) (engine.Result, error) {
+	start := time.Now()
+	select {
+	case <-ctx.Done():
+		return engine.Result{}, ctx.Err()
+	case <-time.After(5 * time.Millisecond):
+	}
+	return engine.Result{StartedAt: start, DurationMs: 5}, nil
+}
+func TestWarmupRequestsAreExcluded(t *testing.T) {
+	seen := 0
+	run, err := RunBenchmark(context.Background(), clockGenerator{}, Config{Model: "m", Concurrency: []int{1}, DurationSeconds: 0.1, WarmupSeconds: 0.1, MaxTokens: 1}, func(engine.Result) { seen++ })
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := run.Points[0]
+	if p.Requests == 0 || seen <= p.Requests+5 || p.DurationSeconds > 0.15 {
+		t.Fatalf("warm-up not excluded: measured %d of %d observed, %.3fs window", p.Requests, seen, p.DurationSeconds)
+	}
+}

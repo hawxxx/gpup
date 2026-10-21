@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,7 +136,7 @@ func newRoot() *cobra.Command {
 			return printJSON(cmd.OutOrStdout(), targets)
 		})
 	}})
-	root.AddCommand(benchCommand(opt, "bench"), benchCommand(opt, "sweep"))
+	root.AddCommand(benchCommand(opt, "bench"), benchCommand(opt, "sweep"), runsCommand(opt))
 	var drop, increase float64
 	compare := &cobra.Command{Use: "compare BASELINE CANDIDATE", Args: cobra.ExactArgs(2), Short: "Compare saved compatible runs", RunE: func(cmd *cobra.Command, args []string) error {
 		return withApp(opt, func(a *app.App) error {
@@ -250,7 +251,7 @@ func serveCommand(opt *cliOptions) *cobra.Command {
 }
 func benchCommand(opt *cliOptions, name string) *cobra.Command {
 	var model, concurrency, prompt, save, baseline string
-	var duration time.Duration
+	var duration, warmup time.Duration
 	var maxTokens int
 	var drop, increase float64
 	var gates []string
@@ -273,7 +274,7 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 			}
 			points = append(points, n)
 		}
-		config := bench.Config{Model: model, Prompt: prompt, Concurrency: points, DurationSeconds: duration.Seconds(), MaxTokens: maxTokens, Name: save}
+		config := bench.Config{Model: model, Prompt: prompt, Concurrency: points, DurationSeconds: duration.Seconds(), WarmupSeconds: warmup.Seconds(), MaxTokens: maxTokens, Name: save}
 		// Validate workload bounds before issuing traffic or registering an endpoint.
 		if model != "" {
 			if err := config.Validate(); err != nil {
@@ -397,6 +398,7 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 	cmd.Flags().StringVar(&model, "model", "", "Model ID (discover only if unambiguous)")
 	cmd.Flags().StringVar(&concurrency, "concurrency", "1,2,4,8", "Comma-separated concurrency points, 1..256")
 	cmd.Flags().DurationVar(&duration, "duration", 10*time.Second, "Duration per point, max 1h")
+	cmd.Flags().DurationVar(&warmup, "warmup", 0, "Unmeasured warm-up before each point, max 10m")
 	cmd.Flags().IntVar(&maxTokens, "max-tokens", 128, "Maximum generated tokens")
 	cmd.Flags().StringVar(&prompt, "prompt", "Explain how GPUs accelerate inference.", "Fixed prompt (not persisted)")
 	cmd.Flags().StringVar(&save, "save", "", "Saved run name")
@@ -405,6 +407,80 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 	cmd.Flags().Float64Var(&increase, "max-latency-increase", 10, "Maximum E2E p95 latency increase percent")
 	cmd.Flags().StringArrayVar(&gates, "fail-if", nil, "CI rule: throughput<-5% or ttft-p99>+10% (requires --compare)")
 	return cmd
+}
+
+func runsCommand(opt *cliOptions) *cobra.Command {
+	runs := &cobra.Command{Use: "runs", Short: "List, export, or delete saved benchmark runs", RunE: func(cmd *cobra.Command, args []string) error {
+		return withApp(opt, func(a *app.App) error {
+			s := a.Snapshot()
+			if opt.json {
+				return printJSON(cmd.OutOrStdout(), s.Runs)
+			}
+			table := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
+			fmt.Fprintln(table, "ID\tNAME\tMODEL\tSTATUS\tPOINTS\tSTARTED")
+			for _, r := range s.Runs {
+				fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%d\t%s\n", r.ID, r.Name, r.Model, r.Status, len(r.Points), r.StartedAt.Local().Format("2006-01-02 15:04"))
+			}
+			if len(s.Runs) == 0 {
+				fmt.Fprintln(table, "No saved runs. Run gpup bench TARGET --save NAME.")
+			}
+			return table.Flush()
+		})
+	}}
+	var format string
+	export := &cobra.Command{Use: "export RUN", Args: cobra.ExactArgs(1), Short: "Export a run as JSON or CSV", RunE: func(cmd *cobra.Command, args []string) error {
+		if format != "json" && format != "csv" {
+			return errors.New("--format must be json or csv")
+		}
+		return withApp(opt, func(a *app.App) error {
+			summary, err := a.Run(args[0])
+			if err != nil {
+				return err
+			}
+			j, err := a.Job(summary.ID)
+			if err != nil || j.Run == nil {
+				return fmt.Errorf("run %s has no stored result", summary.ID)
+			}
+			if format == "json" {
+				return printJSON(cmd.OutOrStdout(), j.Run)
+			}
+			return writeRunCSV(cmd.OutOrStdout(), *j.Run)
+		})
+	}}
+	export.Flags().StringVar(&format, "format", "json", "Output format: json or csv")
+	remove := &cobra.Command{Use: "delete RUN", Args: cobra.ExactArgs(1), Short: "Delete a saved run and its request metadata", RunE: func(cmd *cobra.Command, args []string) error {
+		return withApp(opt, func(a *app.App) error { return a.DeleteRun(args[0]) })
+	}}
+	runs.AddCommand(export, remove)
+	return runs
+}
+
+// writeRunCSV writes one row per operating point; unavailable readings are empty.
+func writeRunCSV(w io.Writer, r bench.Run) error {
+	out := csv.NewWriter(w)
+	_ = out.Write([]string{"run_id", "name", "model", "concurrency", "requests", "errors", "duration_s", "rps", "output_tok_s", "ttft_p50_ms", "ttft_p95_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p95_ms", "itl_p50_ms", "itl_p99_ms", "e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms", "latency_sampled"})
+	f := func(v float64) string { return strconv.FormatFloat(v, 'f', 3, 64) }
+	opt := func(v *float64) string {
+		if v == nil {
+			return ""
+		}
+		return f(*v)
+	}
+	pct := func(p *bench.Percentiles, pick func(bench.Percentiles) float64) string {
+		if p == nil {
+			return ""
+		}
+		return f(pick(*p))
+	}
+	p50 := func(p bench.Percentiles) float64 { return p.P50 }
+	p95 := func(p bench.Percentiles) float64 { return p.P95 }
+	p99 := func(p bench.Percentiles) float64 { return p.P99 }
+	for _, p := range r.Points {
+		e2e := p.E2E
+		_ = out.Write([]string{r.ID, r.Name, r.Model, strconv.Itoa(p.Concurrency), strconv.Itoa(p.Requests), strconv.Itoa(p.Errors), f(p.DurationSeconds), f(p.RPS), opt(p.OutputTokensPerSecond), pct(p.TTFT, p50), pct(p.TTFT, p95), pct(p.TTFT, p99), pct(p.TPOT, p50), pct(p.TPOT, p95), pct(p.ITL, p50), pct(p.ITL, p99), pct(&e2e, p50), pct(&e2e, p95), pct(&e2e, p99), strconv.FormatBool(p.LatencySampled)})
+	}
+	out.Flush()
+	return out.Error()
 }
 
 func sameEndpoint(a, b string) bool {

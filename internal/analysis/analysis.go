@@ -111,8 +111,8 @@ type Comparison struct {
 
 func Compare(a, b bench.Run) (Comparison, error) {
 	out := Comparison{BaselineID: a.ID, CandidateID: b.ID, Changes: []Change{}}
-	if a.Model != b.Model || a.Config.MaxTokens != b.Config.MaxTokens || a.Config.DurationSeconds != b.Config.DurationSeconds || a.Config.WorkloadHash != b.Config.WorkloadHash {
-		return out, errors.New("incompatible workload: model, max tokens, and duration must match")
+	if a.Model != b.Model || a.Config.MaxTokens != b.Config.MaxTokens || a.Config.DurationSeconds != b.Config.DurationSeconds || a.Config.WorkloadHash != b.Config.WorkloadHash || a.Config.WarmupSeconds != b.Config.WarmupSeconds {
+		return out, errors.New("incompatible workload: model, prompt, max tokens, duration, and warm-up must match")
 	}
 	if a.Status != "complete" || b.Status != "complete" {
 		return out, errors.New("only completed runs can be compared")

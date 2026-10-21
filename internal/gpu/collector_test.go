@@ -61,3 +61,11 @@ func TestDCGMSupplementSpacedLabels(t *testing.T) {
 		t.Fatalf("spaced exporter labels not parsed: %+v", devices[0])
 	}
 }
+
+func TestApplyThrottleReasonsIgnoresIdle(t *testing.T) {
+	devices := []GPU{{Index: 0}, {Index: 1}, {Index: 2}}
+	applyThrottleReasons("0, 0x0000000000000001\n1, 0x0000000000000040\n2, [N/A]\n", devices)
+	if devices[0].Throttled == nil || *devices[0].Throttled || devices[1].Throttled == nil || !*devices[1].Throttled || devices[2].Throttled != nil {
+		t.Fatalf("unexpected throttle states: %v %v %v", devices[0].Throttled, devices[1].Throttled, devices[2].Throttled)
+	}
+}
