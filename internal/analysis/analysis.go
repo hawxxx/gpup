@@ -77,7 +77,15 @@ func Findings(o Observation) []bench.Finding {
 	}
 	return out
 }
+
+// DetectKnee finds the closed-loop concurrency after which throughput stops
+// scaling while latency rises. Open-loop points use SaturationRate instead.
 func DetectKnee(points []bench.Point) *int {
+	for _, point := range points {
+		if point.RequestRate != nil {
+			return nil
+		}
+	}
 	p := append([]bench.Point(nil), points...)
 	sort.Slice(p, func(i, j int) bool { return p[i].Concurrency < p[j].Concurrency })
 	for i := 1; i < len(p); i++ {
@@ -94,14 +102,56 @@ func DetectKnee(points []bench.Point) *int {
 	return nil
 }
 
+// SaturationRate returns the lowest offered open-loop rate the target did not
+// sustain: arrivals waited for the in-flight cap, or successful completions
+// fell more than three standard deviations below the Poisson arrival count
+// expected for the window, so short windows are not flagged for noise alone.
+func SaturationRate(points []bench.Point) *float64 {
+	var out *float64
+	for _, p := range points {
+		if p.RequestRate == nil || (out != nil && *out <= *p.RequestRate) {
+			continue
+		}
+		expected := *p.RequestRate * p.DurationSeconds
+		if p.Delayed > 0 || p.RPS*p.DurationSeconds < expected-3*math.Sqrt(expected) {
+			v := *p.RequestRate
+			out = &v
+		}
+	}
+	return out
+}
+
+// pointKey identifies an operating point within a sweep.
+type pointKey struct {
+	concurrency int
+	rate        float64
+}
+
+func keyOf(p bench.Point) pointKey {
+	k := pointKey{concurrency: p.Concurrency}
+	if p.RequestRate != nil {
+		k.rate = *p.RequestRate
+	}
+	return k
+}
+
 type Change struct {
 	Concurrency                  int      `json:"concurrency"`
+	RequestRate                  *float64 `json:"requestRate,omitempty"`
 	RPSPercent                   float64  `json:"rpsPercent"`
 	LatencyP95Percent            float64  `json:"latencyP95Percent"`
 	OutputTokensPerSecondPercent *float64 `json:"outputTokensPerSecondPercent,omitempty"`
 	TTFTP99Percent               *float64 `json:"ttftP99Percent,omitempty"`
 	ThroughputMetric             string   `json:"throughputMetric"`
 }
+
+func (c Change) label() string {
+	if c.RequestRate != nil {
+		return fmt.Sprintf("%g req/s", *c.RequestRate)
+	}
+	return fmt.Sprintf("concurrency %d", c.Concurrency)
+}
+
 type Comparison struct {
 	BaselineID  string   `json:"baselineId"`
 	CandidateID string   `json:"candidateId"`
@@ -114,6 +164,9 @@ func Compare(a, b bench.Run) (Comparison, error) {
 	if a.Model != b.Model || a.Config.MaxTokens != b.Config.MaxTokens || a.Config.DurationSeconds != b.Config.DurationSeconds || a.Config.WorkloadHash != b.Config.WorkloadHash || a.Config.WarmupSeconds != b.Config.WarmupSeconds {
 		return out, errors.New("incompatible workload: model, prompt, max tokens, duration, and warm-up must match")
 	}
+	if a.Config.OpenLoop() != b.Config.OpenLoop() {
+		return out, errors.New("incompatible workload: closed-loop concurrency and open-loop request-rate sweeps cannot be compared")
+	}
 	if a.Status != "complete" || b.Status != "complete" {
 		return out, errors.New("only completed runs can be compared")
 	}
@@ -121,12 +174,12 @@ func Compare(a, b bench.Run) (Comparison, error) {
 		return out, errors.New("incompatible concurrency sweep")
 	}
 	for _, run := range []bench.Run{a, b} {
-		seen := map[int]bool{}
+		seen := map[pointKey]bool{}
 		for _, point := range run.Points {
-			if seen[point.Concurrency] {
+			if seen[keyOf(point)] {
 				return out, errors.New("duplicate concurrency points")
 			}
-			seen[point.Concurrency] = true
+			seen[keyOf(point)] = true
 			if point.Errors > 0 {
 				return out, errors.New("errorful benchmark points cannot be compared")
 			}
@@ -135,7 +188,7 @@ func Compare(a, b bench.Run) (Comparison, error) {
 	for _, p := range a.Points {
 		var q *bench.Point
 		for i := range b.Points {
-			if b.Points[i].Concurrency == p.Concurrency {
+			if keyOf(b.Points[i]) == keyOf(p) {
 				q = &b.Points[i]
 				break
 			}
@@ -143,7 +196,7 @@ func Compare(a, b bench.Run) (Comparison, error) {
 		if q == nil || p.RPS <= 0 || p.E2E.P95 <= 0 || q.RPS <= 0 || q.E2E.P95 <= 0 {
 			return out, errors.New("comparison requires matching measured successful points")
 		}
-		change := Change{Concurrency: p.Concurrency, RPSPercent: (q.RPS/p.RPS - 1) * 100, LatencyP95Percent: (q.E2E.P95/p.E2E.P95 - 1) * 100, ThroughputMetric: "rps"}
+		change := Change{Concurrency: p.Concurrency, RequestRate: p.RequestRate, RPSPercent: (q.RPS/p.RPS - 1) * 100, LatencyP95Percent: (q.E2E.P95/p.E2E.P95 - 1) * 100, ThroughputMetric: "rps"}
 		if p.OutputTokensPerSecond != nil && q.OutputTokensPerSecond != nil && *p.OutputTokensPerSecond > 0 {
 			v := (*q.OutputTokensPerSecond / *p.OutputTokensPerSecond - 1) * 100
 			change.OutputTokensPerSecondPercent = &v
@@ -179,7 +232,7 @@ func CheckThresholds(c Comparison, maxThroughputDropPercent, maxLatencyIncreaseP
 			return errors.New("comparison contains nonfinite throughput")
 		}
 		if throughput < -maxThroughputDropPercent || p.LatencyP95Percent > maxLatencyIncreasePercent {
-			return fmt.Errorf("regression at concurrency %d: %s %.1f%%, p95 latency %.1f%%", p.Concurrency, metric, throughput, p.LatencyP95Percent)
+			return fmt.Errorf("regression at %s: %s %.1f%%, p95 latency %.1f%%", p.label(), metric, throughput, p.LatencyP95Percent)
 		}
 	}
 	return nil
@@ -198,7 +251,7 @@ func CheckTTFTP99Threshold(c Comparison, maxIncreasePercent float64) error {
 			return errors.New("nonfinite TTFT p99")
 		}
 		if v > maxIncreasePercent {
-			return fmt.Errorf("TTFT p99 regression at concurrency %d: %.1f%%", p.Concurrency, v)
+			return fmt.Errorf("TTFT p99 regression at %s: %.1f%%", p.label(), v)
 		}
 	}
 	return nil

@@ -25,8 +25,24 @@ type Config struct {
 	// WarmupSeconds runs traffic at each point before measurement starts.
 	// Warm-up requests are visible live but excluded from point statistics.
 	WarmupSeconds float64 `json:"warmupSeconds,omitempty"`
-	Name          string  `json:"name,omitempty"`
+	// RequestRates switches to an open-loop sweep: requests arrive as a Poisson
+	// process at each rate (requests/second), independent of response times.
+	// Concurrency then holds exactly one value, the in-flight request cap.
+	RequestRates []float64 `json:"requestRates,omitempty"`
+	// SLO enables goodput: the share of measured requests meeting every target.
+	SLO  *SLO   `json:"slo,omitempty"`
+	Name string `json:"name,omitempty"`
 }
+
+// SLO holds per-request latency targets in milliseconds; zero disables one.
+type SLO struct {
+	TTFTMs float64 `json:"ttftMs,omitempty"`
+	TPOTMs float64 `json:"tpotMs,omitempty"`
+	E2EMs  float64 `json:"e2eMs,omitempty"`
+}
+
+// OpenLoop reports whether the sweep varies offered request rate.
+func (c Config) OpenLoop() bool { return len(c.RequestRates) > 0 }
 
 func (c Config) Validate() error {
 	if c.DurationSeconds <= 0 || c.DurationSeconds > 3600 || math.IsNaN(c.DurationSeconds) || math.IsInf(c.DurationSeconds, 0) {
@@ -50,6 +66,34 @@ func (c Config) Validate() error {
 			return errors.New("concurrency points must be unique")
 		}
 		seen[n] = true
+	}
+	if c.OpenLoop() {
+		if len(c.Concurrency) != 1 {
+			return errors.New("request-rate sweeps take exactly one concurrency value, the in-flight cap")
+		}
+		if len(c.RequestRates) > 32 {
+			return errors.New("provide 1 to 32 request rates")
+		}
+		seenRate := make(map[float64]bool, len(c.RequestRates))
+		for _, r := range c.RequestRates {
+			if !(r > 0 && r <= 10000) {
+				return errors.New("request rates must be in (0,10000] requests/second")
+			}
+			if seenRate[r] {
+				return errors.New("request rates must be unique")
+			}
+			seenRate[r] = true
+		}
+	}
+	if c.SLO != nil {
+		for _, v := range []float64{c.SLO.TTFTMs, c.SLO.TPOTMs, c.SLO.E2EMs} {
+			if !(v >= 0 && v <= 3600000) {
+				return errors.New("SLO targets must be in [0,3600000] ms")
+			}
+		}
+		if c.SLO.TTFTMs == 0 && c.SLO.TPOTMs == 0 && c.SLO.E2EMs == 0 {
+			return errors.New("SLO requires at least one target")
+		}
 	}
 	if c.Model == "" {
 		return errors.New("model required")
@@ -128,11 +172,25 @@ type Finding struct {
 	Recommendation string   `json:"recommendation"`
 }
 type Point struct {
-	StartedAt             time.Time    `json:"startedAt"`
-	EndedAt               time.Time    `json:"endedAt"`
-	Concurrency           int          `json:"concurrency"`
-	Requests              int          `json:"requests"`
-	Errors                int          `json:"errors"`
+	StartedAt   time.Time `json:"startedAt"`
+	EndedAt     time.Time `json:"endedAt"`
+	Concurrency int       `json:"concurrency"`
+	// RequestRate is the offered Poisson arrival rate of an open-loop point.
+	RequestRate *float64 `json:"requestRate,omitempty"`
+	Requests    int      `json:"requests"`
+	Errors      int      `json:"errors"`
+	// ErrorKinds counts measured failures by engine.ErrorKind* class.
+	ErrorKinds map[string]int `json:"errorKinds,omitempty"`
+	// Incomplete counts measured requests still in flight when the point
+	// ended. They are cancelled and excluded from every other statistic.
+	Incomplete int `json:"incomplete"`
+	// Delayed counts open-loop arrivals that waited for an in-flight slot, so
+	// they were sent later than scheduled and the offered rate was not met.
+	Delayed int `json:"delayed,omitempty"`
+	// Goodput is the fraction of measured requests (errors included) meeting
+	// every SLO target; GoodputRPS is those requests per second.
+	Goodput               *float64     `json:"goodput,omitempty"`
+	GoodputRPS            *float64     `json:"goodputRps,omitempty"`
 	DurationSeconds       float64      `json:"durationSeconds"`
 	RPS                   float64      `json:"rps"`
 	OutputTokensPerSecond *float64     `json:"outputTokensPerSecond,omitempty"`
@@ -168,101 +226,28 @@ func RunBenchmark(ctx context.Context, c Generator, config Config, onResult func
 	safe.Prompt = ""
 	safe.WorkloadHash = fmt.Sprintf("%x", sha256.Sum256([]byte(config.Prompt)))
 	safe.Concurrency = append([]int(nil), config.Concurrency...)
+	safe.RequestRates = append([]float64(nil), config.RequestRates...)
 	run := Run{ID: strconv.FormatInt(start.UnixNano(), 36), Name: config.Name, TargetID: config.TargetID, Model: config.Model, StartedAt: start, Status: "running", Config: safe, Points: []Point{}, Findings: []Finding{}}
 	if e := config.Validate(); e != nil {
 		run.Status = "error"
 		return run, e
 	}
-	for _, n := range config.Concurrency {
+	steps := len(config.Concurrency)
+	if config.OpenLoop() {
+		steps = len(config.RequestRates)
+	}
+	for i := 0; i < steps; i++ {
 		if e := ctx.Err(); e != nil {
 			run.Status = "cancelled"
 			return run, e
 		}
-		p := Point{Concurrency: n}
-		warmup := time.Duration(config.WarmupSeconds * float64(time.Second))
-		begin := time.Now().Add(warmup)
-		p.StartedAt = begin
-		pointCtx, cancel := context.WithTimeout(ctx, warmup+time.Duration(config.DurationSeconds*float64(time.Second)))
-		var mu sync.Mutex
-		var wg sync.WaitGroup
-		ttft, tpot, e2e, itl := newLatencyReservoir(1), newLatencyReservoir(2), newLatencyReservoir(3), newLatencyReservoir(4)
-		tokens := 0
-		known := true
-		for i := 0; i < n; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for pointCtx.Err() == nil {
-					issued := time.Now()
-					r, e := c.Generate(pointCtx, config.Model, config.Prompt, config.MaxTokens)
-					r.Concurrency = n
-					if e != nil && pointCtx.Err() != nil {
-						return
-					}
-					mu.Lock()
-					// Warm-up traffic is shown live but never measured.
-					switch {
-					case issued.Before(begin):
-					case e != nil:
-						p.Requests++
-						p.Errors++
-					default:
-						p.Requests++
-						e2e.add(r.DurationMs)
-						if r.TTFTMs != nil {
-							ttft.add(*r.TTFTMs)
-						}
-						if r.TPOTMs != nil {
-							tpot.add(*r.TPOTMs)
-						}
-						for _, gap := range r.ChunkGapsMs {
-							itl.add(gap)
-						}
-						if r.OutputTokens == nil {
-							known = false
-						} else {
-							tokens += *r.OutputTokens
-						}
-					}
-					if onResult != nil {
-						onResult(r)
-					}
-					mu.Unlock()
-					if e != nil {
-						select {
-						case <-pointCtx.Done():
-							return
-						case <-time.After(10 * time.Millisecond):
-						}
-					}
-				}
-			}()
+		n, rate := config.Concurrency[0], 0.0
+		if config.OpenLoop() {
+			rate = config.RequestRates[i]
+		} else {
+			n = config.Concurrency[i]
 		}
-		wg.Wait()
-		cancel()
-		p.EndedAt = time.Now()
-		p.DurationSeconds = p.EndedAt.Sub(begin).Seconds()
-		p.RPS = float64(p.Requests-p.Errors) / p.DurationSeconds
-		p.E2E = e2e.summary()
-		p.LatencySampleCount = len(e2e.values)
-		p.LatencySampled = e2e.count > LatencySampleLimit
-		if ttft.count > 0 {
-			v := ttft.summary()
-			p.TTFT = &v
-		}
-		if tpot.count > 0 {
-			v := tpot.summary()
-			p.TPOT = &v
-		}
-		if itl.count > 0 {
-			v := itl.summary()
-			p.ITL = &v
-		}
-		if known && e2e.count > 0 {
-			v := float64(tokens) / p.DurationSeconds
-			p.OutputTokensPerSecond = &v
-		}
-		run.Points = append(run.Points, p)
+		run.Points = append(run.Points, runPoint(ctx, c, config, n, rate, onResult))
 	}
 	if e := ctx.Err(); e != nil {
 		run.Status = "cancelled"
@@ -270,4 +255,202 @@ func RunBenchmark(ctx context.Context, c Generator, config Config, onResult func
 	}
 	run.Status = "complete"
 	return run, nil
+}
+
+// pointStats accumulates one point's measurements; callers hold mu.
+type pointStats struct {
+	mu                   sync.Mutex
+	p                    Point
+	begin                time.Time
+	slo                  *SLO
+	ttft, tpot, e2e, itl *latencyReservoir
+	tokens               int
+	usageKnown           bool
+	good                 int
+	sloUnknown           bool
+}
+
+func (s *pointStats) record(issued time.Time, r engine.Result, err error, cancelled bool) {
+	// Warm-up traffic is shown live but never measured.
+	if issued.Before(s.begin) {
+		return
+	}
+	switch {
+	case err != nil && cancelled:
+		s.p.Incomplete++
+	case err != nil:
+		s.p.Requests++
+		s.p.Errors++
+		kind := r.ErrorKind
+		if kind == "" {
+			kind = engine.ClassifyError(err)
+		}
+		if s.p.ErrorKinds == nil {
+			s.p.ErrorKinds = map[string]int{}
+		}
+		s.p.ErrorKinds[kind]++
+	default:
+		s.p.Requests++
+		s.e2e.add(r.DurationMs)
+		if r.TTFTMs != nil {
+			s.ttft.add(*r.TTFTMs)
+		}
+		if r.TPOTMs != nil {
+			s.tpot.add(*r.TPOTMs)
+		}
+		for _, gap := range r.ChunkGapsMs {
+			s.itl.add(gap)
+		}
+		if r.OutputTokens == nil {
+			s.usageKnown = false
+		} else {
+			s.tokens += *r.OutputTokens
+		}
+		if s.slo != nil {
+			met, known := s.slo.met(r)
+			if !known {
+				s.sloUnknown = true
+			} else if met {
+				s.good++
+			}
+		}
+	}
+}
+
+// met reports whether r meets every target; known is false when a targeted
+// timing is unavailable, such as TPOT without reported token usage.
+func (o SLO) met(r engine.Result) (met, known bool) {
+	met = true
+	if o.TTFTMs > 0 {
+		if r.TTFTMs == nil {
+			return false, false
+		}
+		met = met && *r.TTFTMs <= o.TTFTMs
+	}
+	if o.TPOTMs > 0 {
+		switch {
+		case r.TPOTMs != nil:
+			met = met && *r.TPOTMs <= o.TPOTMs
+		case r.OutputTokens == nil:
+			return false, false
+		}
+		// One generated token has no inter-token time and cannot miss TPOT.
+	}
+	if o.E2EMs > 0 {
+		met = met && r.DurationMs <= o.E2EMs
+	}
+	return met, true
+}
+
+func (s *pointStats) finish(end time.Time) Point {
+	p := s.p
+	p.EndedAt = end
+	p.DurationSeconds = end.Sub(s.begin).Seconds()
+	p.RPS = float64(p.Requests-p.Errors) / p.DurationSeconds
+	p.E2E = s.e2e.summary()
+	p.LatencySampleCount = len(s.e2e.values)
+	p.LatencySampled = s.e2e.count > LatencySampleLimit
+	for _, m := range []struct {
+		r   *latencyReservoir
+		out **Percentiles
+	}{{s.ttft, &p.TTFT}, {s.tpot, &p.TPOT}, {s.itl, &p.ITL}} {
+		if m.r.count > 0 {
+			v := m.r.summary()
+			*m.out = &v
+		}
+	}
+	if s.usageKnown && s.e2e.count > 0 {
+		v := float64(s.tokens) / p.DurationSeconds
+		p.OutputTokensPerSecond = &v
+	}
+	if s.slo != nil && !s.sloUnknown && p.Requests > 0 {
+		fraction, rps := float64(s.good)/float64(p.Requests), float64(s.good)/p.DurationSeconds
+		p.Goodput, p.GoodputRPS = &fraction, &rps
+	}
+	return p
+}
+
+// runPoint measures one operating point. With rate zero, n closed-loop
+// workers each send the next request when the previous one finishes. With a
+// positive rate, requests arrive as a Poisson process and n caps how many are
+// in flight; arrivals beyond the cap wait for a slot and are counted Delayed.
+func runPoint(ctx context.Context, c Generator, config Config, n int, rate float64, onResult func(engine.Result)) Point {
+	warmup := time.Duration(config.WarmupSeconds * float64(time.Second))
+	begin := time.Now().Add(warmup)
+	s := &pointStats{p: Point{Concurrency: n, StartedAt: begin}, begin: begin, slo: config.SLO, usageKnown: true,
+		ttft: newLatencyReservoir(1), tpot: newLatencyReservoir(2), e2e: newLatencyReservoir(3), itl: newLatencyReservoir(4)}
+	if rate > 0 {
+		s.p.RequestRate = &rate
+	}
+	pointCtx, cancel := context.WithTimeout(ctx, warmup+time.Duration(config.DurationSeconds*float64(time.Second)))
+	defer cancel()
+	send := func() error {
+		issued := time.Now()
+		r, e := c.Generate(pointCtx, config.Model, config.Prompt, config.MaxTokens)
+		r.Concurrency, r.RequestRate = n, rate
+		cancelled := e != nil && pointCtx.Err() != nil
+		s.mu.Lock()
+		s.record(issued, r, e, cancelled)
+		if onResult != nil && !cancelled {
+			onResult(r)
+		}
+		s.mu.Unlock()
+		return e
+	}
+	var wg sync.WaitGroup
+	if rate <= 0 {
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for pointCtx.Err() == nil {
+					if send() != nil {
+						// Back off briefly so a failing endpoint is not hammered.
+						select {
+						case <-pointCtx.Done():
+						case <-time.After(10 * time.Millisecond):
+						}
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		return s.finish(time.Now())
+	}
+	// A fixed seed makes the arrival schedule reproducible for a given rate.
+	arrivals := rand.New(rand.NewSource(int64(math.Float64bits(rate))))
+	slots := make(chan struct{}, n)
+	next := time.Now()
+	for {
+		next = next.Add(time.Duration(arrivals.ExpFloat64() / rate * float64(time.Second)))
+		timer := time.NewTimer(time.Until(next))
+		select {
+		case <-pointCtx.Done():
+			timer.Stop()
+			wg.Wait()
+			return s.finish(time.Now())
+		case <-timer.C:
+		}
+		select {
+		case slots <- struct{}{}:
+		default:
+			if !next.Before(begin) {
+				s.mu.Lock()
+				s.p.Delayed++
+				s.mu.Unlock()
+			}
+			select {
+			case slots <- struct{}{}:
+			case <-pointCtx.Done():
+				wg.Wait()
+				return s.finish(time.Now())
+			}
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-slots }()
+			_ = send()
+		}()
+	}
 }

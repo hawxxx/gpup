@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"gpup/internal/bench"
+	"strings"
 	"testing"
 )
 
@@ -88,5 +89,53 @@ func TestCompareRejectsDuplicateConcurrencySets(t *testing.T) {
 	b := bench.Run{Status: "complete", Points: []bench.Point{p, q}}
 	if _, err := Compare(a, b); err == nil {
 		t.Fatal("duplicate concurrency comparison accepted")
+	}
+}
+
+func ratePoint(rate, rps float64, delayed int) bench.Point {
+	return bench.Point{Concurrency: 8, RequestRate: &rate, RPS: rps, Delayed: delayed, DurationSeconds: 100, E2E: bench.Percentiles{P95: 10}}
+}
+
+func TestSaturationRateAndNoKneeForOpenLoop(t *testing.T) {
+	points := []bench.Point{ratePoint(8, 7.6, 3), ratePoint(2, 2.1, 0), ratePoint(4, 3.0, 0)}
+	if r := SaturationRate(points); r == nil || *r != 4 {
+		t.Fatalf("saturation rate = %v, want 4", r)
+	}
+	if SaturationRate(points[1:2]) != nil {
+		t.Fatal("sustained rate reported as saturated")
+	}
+	// 15 completions for 20 expected arrivals is within Poisson noise.
+	short := ratePoint(5, 3.75, 0)
+	short.DurationSeconds = 4
+	if SaturationRate([]bench.Point{short}) != nil {
+		t.Fatal("short-window Poisson noise reported as saturation")
+	}
+	if DetectKnee(points) != nil {
+		t.Fatal("concurrency knee reported for an open-loop sweep")
+	}
+}
+
+func TestCompareMatchesOpenLoopPointsByRate(t *testing.T) {
+	run := func(rates ...float64) bench.Run {
+		r := bench.Run{Model: "m", Status: "complete", Config: bench.Config{Concurrency: []int{8}, RequestRates: rates}}
+		for _, rate := range rates {
+			r.Points = append(r.Points, ratePoint(rate, rate, 0))
+		}
+		return r
+	}
+	c, err := Compare(run(1, 2), run(1, 2))
+	if err != nil || len(c.Changes) != 2 || c.Changes[1].RequestRate == nil || *c.Changes[1].RequestRate != 2 {
+		t.Fatalf("open-loop comparison failed: %+v %v", c, err)
+	}
+	if _, err := Compare(run(1, 2), run(1, 3)); err == nil {
+		t.Fatal("compared different offered rates")
+	}
+	closed := bench.Run{Model: "m", Status: "complete", Config: bench.Config{Concurrency: []int{8}}, Points: []bench.Point{{Concurrency: 8, RPS: 1, E2E: bench.Percentiles{P95: 1}}}}
+	if _, err := Compare(closed, run(1)); err == nil {
+		t.Fatal("compared closed-loop with open-loop sweep")
+	}
+	c.Changes[0].RPSPercent = -50
+	if err := CheckThresholds(c, 10, 10); err == nil || !strings.Contains(err.Error(), "1 req/s") {
+		t.Fatalf("open-loop regression not labeled by rate: %v", err)
 	}
 }

@@ -53,6 +53,8 @@ type Result struct {
 	ErrorKind   string    `json:"errorKind,omitempty"`
 	ChunkGapsMs []float64 `json:"chunkGapsMs,omitempty"`
 	Concurrency int       `json:"concurrency,omitempty"`
+	// RequestRate is the offered open-loop arrival rate that sent the request.
+	RequestRate float64 `json:"requestRate,omitempty"`
 }
 type Metric struct {
 	Value  float64 `json:"value"`

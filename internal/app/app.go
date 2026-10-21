@@ -57,9 +57,10 @@ type Job struct {
 
 // JobProgress summarizes requests completed so far by a running benchmark.
 type JobProgress struct {
-	Concurrency int `json:"concurrency"`
-	Requests    int `json:"requests"`
-	Errors      int `json:"errors"`
+	Concurrency int     `json:"concurrency"`
+	RequestRate float64 `json:"requestRate,omitempty"`
+	Requests    int     `json:"requests"`
+	Errors      int     `json:"errors"`
 	// Point is the 1-based index of the active concurrency point out of Points.
 	Point  int `json:"point"`
 	Points int `json:"points"`
@@ -124,6 +125,9 @@ func New(path, dcgmURL string) (*App, error) {
 			} else {
 				var requests []engine.Result
 				if e = json.Unmarshal(row, &requests); e == nil {
+					for i := range requests {
+						requests[i].ChunkGapsMs = nil
+					}
 					a.state.Requests = append(a.state.Requests, requests...)
 					if len(requests) > 0 {
 						a.loadedRequestChunks[requestChunkKey(requests)] = true
@@ -379,7 +383,11 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 	id := ID("run")
 	ctx, cancel := context.WithCancel(a.ctx)
 	a.cancels[id] = cancel
-	a.jobs[id] = Job{ID: id, Status: "running", Progress: &JobProgress{Concurrency: c.Concurrency[0], Point: 1, Points: len(c.Concurrency)}}
+	progress := &JobProgress{Concurrency: c.Concurrency[0], Point: 1, Points: len(c.Concurrency)}
+	if c.OpenLoop() {
+		progress.RequestRate, progress.Points = c.RequestRates[0], len(c.RequestRates)
+	}
+	a.jobs[id] = Job{ID: id, Status: "running", Progress: progress}
 	safeConfig := c
 	safeConfig.Prompt = ""
 	a.state.Runs = append([]bench.Run{{ID: id, Name: c.Name, TargetID: t.ID, Model: c.Model, StartedAt: time.Now(), Status: "running", Config: safeConfig, Points: []bench.Point{}, Findings: []bench.Finding{}}}, a.state.Runs...)
@@ -394,10 +402,15 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 			a.recordRequestLocked(r)
 			if j, ok := a.jobs[id]; ok && j.Progress != nil {
 				p := *j.Progress
-				if r.Concurrency != p.Concurrency {
-					p = JobProgress{Concurrency: r.Concurrency, Point: p.Point, Points: p.Points}
+				if r.Concurrency != p.Concurrency || r.RequestRate != p.RequestRate {
+					p = JobProgress{Concurrency: r.Concurrency, RequestRate: r.RequestRate, Point: p.Point, Points: p.Points}
 					for i, n := range c.Concurrency {
-						if n == r.Concurrency {
+						if n == r.Concurrency && !c.OpenLoop() {
+							p.Point = i + 1
+						}
+					}
+					for i, rate := range c.RequestRates {
+						if rate == r.RequestRate {
 							p.Point = i + 1
 						}
 					}
@@ -427,6 +440,9 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 		run.Findings = []bench.Finding{}
 		if run.Knee != nil {
 			run.Findings = append(run.Findings, bench.Finding{Kind: "saturation", Severity: "warning", Confidence: "medium", Summary: fmt.Sprintf("Observed concurrency knee near %d", *run.Knee), Evidence: []string{"Measured throughput flattened while E2E p95 latency increased; output tokens/sec is preferred when usage is known, otherwise requests/sec."}, Recommendation: "Rerun representative prompts around the knee before choosing a production limit."})
+		}
+		if rate := analysis.SaturationRate(run.Points); rate != nil {
+			run.Findings = append(run.Findings, bench.Finding{Kind: "saturation", Severity: "warning", Confidence: "medium", Summary: fmt.Sprintf("Offered load of %g req/s was not sustained", *rate), Evidence: []string{"Arrivals waited for the in-flight cap, or successful completions fell well below the expected Poisson arrival count."}, Recommendation: "Treat the highest sustained rate below this point as the capacity limit for this workload, and confirm it with a longer run."})
 		}
 		delete(a.cancels, id)
 		summary := summaryRun(run)
@@ -478,6 +494,9 @@ func (a *App) recordRequest(r engine.Result) {
 	a.recordRequestLocked(r)
 }
 func (a *App) recordRequestLocked(r engine.Result) {
+	// Chunk gaps are already summarized into each point's ITL. Keeping them per
+	// request made live snapshots several megabytes, mostly unused gap arrays.
+	r.ChunkGapsMs = nil
 	a.revision++
 	a.state.Requests = append(a.state.Requests, r)
 	if len(a.state.Requests) > 2000 {
