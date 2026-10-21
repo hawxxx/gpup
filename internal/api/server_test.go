@@ -169,3 +169,48 @@ func TestPrometheusExpositionIncludesEngineReadings(t *testing.T) {
 		t.Fatalf("missing engine readings:\n%s", body)
 	}
 }
+
+func TestBenchmarkAPIAcceptsOpenLoopAndSLOFields(t *testing.T) {
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer fixture.Close()
+	a, err := app.New(filepath.Join(t.TempDir(), "api.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	target, err := a.AddTarget(context.Background(), engine.Target{Name: "fixture", Engine: "openai", URL: fixture.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Handler(a, fstest.MapFS{}, Options{})
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", "http://localhost/api/v1/benchmarks", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	if w := post(`{"targetId":"` + target.ID + `","model":"x","durationSeconds":1,"concurrency":[4,8],"requestRates":[2],"maxTokens":1}`); w.Code != 400 || !strings.Contains(w.Body.String(), "in-flight cap") {
+		t.Fatalf("several caps accepted for an open-loop sweep: %d %s", w.Code, w.Body.String())
+	}
+	w := post(`{"targetId":"` + target.ID + `","model":"x","durationSeconds":0.1,"concurrency":[4],"requestRates":[20],"slo":{"ttftMs":500},"maxTokens":1}`)
+	if w.Code != 202 {
+		t.Fatalf("open-loop benchmark rejected: %d %s", w.Code, w.Body.String())
+	}
+	var started struct{ ID string }
+	_ = json.Unmarshal(w.Body.Bytes(), &started)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		j, err := a.Job(started.ID)
+		if err == nil && j.Status != "running" {
+			p := j.Run.Points[0]
+			if j.Status != "complete" || p.RequestRate == nil || p.Goodput == nil || j.Run.Config.SLO == nil {
+				t.Fatalf("open-loop result incomplete: %+v", j.Run)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("benchmark did not finish")
+		}
+	}
+}
