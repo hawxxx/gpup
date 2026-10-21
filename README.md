@@ -116,6 +116,10 @@ NVML collection requires a cgo build and a usable NVIDIA driver. Builds with `CG
 
 For frontend development, run `./bin/gpup serve` and `make dev` in separate terminals after building. Open the URL printed by Vite; it proxies `/api` requests to `http://127.0.0.1:7331`.
 
+### Releases
+
+Pull requests are squash-merged, and their titles must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...); a CI check enforces this. [release-please](https://github.com/googleapis/release-please) reads those commits on `main` and keeps a release pull request open that bumps the version in `internal/app/app.go`, `web/package.json` and the Helm chart, and updates `CHANGELOG.md`. Merging it tags `vX.Y.Z`, creates the GitHub release, and publishes a signed multi-arch image to `ghcr.io/hawxxx/gpup` after a Trivy scan. Dependabot opens weekly updates for Go modules, npm packages, Docker base images and GitHub Actions.
+
 ## Deployment
 
 Run the following commands from the repository root. Docker builds the frontend and backend inside the image, so you do not need Go or Node.js installed on the host. Packaging also includes a [systemd service](deploy/systemd/gpup.service).
