@@ -60,7 +60,7 @@ Run the same workload before and after a change to your inference server:
   --save optimized --compare baseline --max-throughput-drop 10 --max-latency-increase 20
 ```
 
-`--duration` applies to each concurrency point. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
+`--duration` applies to each concurrency point. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
 
 You can also sweep concurrency, capture passive telemetry, or compare existing runs:
 

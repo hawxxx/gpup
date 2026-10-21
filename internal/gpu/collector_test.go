@@ -53,3 +53,11 @@ func TestMissingProvider(t *testing.T) {
 		t.Fatalf("got=%v err=%v", got, err)
 	}
 }
+
+func TestDCGMSupplementSpacedLabels(t *testing.T) {
+	devices := []GPU{{UUID: "GPU-abc", Source: "nvml"}}
+	supplementDCGM("DCGM_FI_DEV_XID_ERRORS{gpu=\"0\",UUID=\"GPU-abc\",modelName=\"NVIDIA GeForce RTX 4090\",Hostname=\"host\"} 13\n", devices)
+	if devices[0].XIDErrors == nil || *devices[0].XIDErrors != 13 || devices[0].Source != "nvml+dcgm" {
+		t.Fatalf("spaced exporter labels not parsed: %+v", devices[0])
+	}
+}

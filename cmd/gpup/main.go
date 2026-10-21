@@ -292,9 +292,19 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 				if !strings.HasPrefix(args[0], "http://") && !strings.HasPrefix(args[0], "https://") {
 					return errors.New("target not found; pass a configured name or HTTP(S) URL")
 				}
-				t, err = a.AddTarget(cmd.Context(), engine.Target{Name: app.ID("cli"), Engine: "openai", URL: args[0]})
-				if err != nil {
-					return err
+				// Reuse a target registered for this URL so repeated URL benchmarks do not exhaust the target limit.
+				found := false
+				for _, existing := range a.Snapshot().Targets {
+					if sameEndpoint(existing.URL, args[0]) {
+						t, found = existing, true
+						break
+					}
+				}
+				if !found {
+					t, err = a.AddTarget(cmd.Context(), engine.Target{Name: app.ID("cli"), Engine: "openai", URL: args[0]})
+					if err != nil {
+						return err
+					}
 				}
 			}
 			config.TargetID = t.ID
@@ -327,6 +337,7 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 			}
 			ticker := time.NewTicker(100 * time.Millisecond)
 			defer ticker.Stop()
+			lastProgress := time.Now()
 			for {
 				select {
 				case <-cmd.Context().Done():
@@ -338,6 +349,10 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 						return err
 					}
 					if j.Status == "running" {
+						if j.Progress != nil && time.Since(lastProgress) >= 5*time.Second {
+							fmt.Fprintf(cmd.ErrOrStderr(), "running · concurrency %d · %d requests · %d errors\n", j.Progress.Concurrency, j.Progress.Requests, j.Progress.Errors)
+							lastProgress = time.Now()
+						}
 						continue
 					}
 					if j.Run == nil {
@@ -390,6 +405,11 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 	cmd.Flags().Float64Var(&increase, "max-latency-increase", 10, "Maximum E2E p95 latency increase percent")
 	cmd.Flags().StringArrayVar(&gates, "fail-if", nil, "CI rule: throughput<-5% or ttft-p99>+10% (requires --compare)")
 	return cmd
+}
+
+func sameEndpoint(a, b string) bool {
+	normalize := func(raw string) string { return strings.TrimSuffix(strings.TrimRight(raw, "/"), "/v1") }
+	return normalize(a) == normalize(b)
 }
 
 func parseGateRules(rules []string) (drop, ttft *float64, err error) {

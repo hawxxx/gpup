@@ -85,3 +85,40 @@ func TestInvalidStreams(t *testing.T) {
 		s.Close()
 	}
 }
+
+func TestScrapeSpacedLabels(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "# HELP vllm:num_requests_waiting waiting\nvllm:num_requests_waiting{model_name=\"my model\"} 4 1700000000000\nvllm:kv_cache_usage_perc{model_name=\"my model\"} 0.5\n")
+	}))
+	defer s.Close()
+	c, _ := New(Target{Engine: "vllm", URL: s.URL, MetricsURL: s.URL + "/metrics"})
+	values, err := c.Scrape(context.Background())
+	if err != nil || values["requestsWaiting"].Value != 4 || values["kvCacheFraction"].Value != 0.5 {
+		t.Fatalf("values=%v err=%v", values, err)
+	}
+}
+
+func TestHTTPErrorDetail(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(404)
+		fmt.Fprint(w, `{"error":{"message":"The model `+"`missing`"+` does not exist."}}`)
+	}))
+	defer s.Close()
+	c, _ := New(Target{Engine: "vllm", URL: s.URL})
+	_, err := c.Generate(context.Background(), "missing", "p", 8)
+	if err == nil || err.Error() != "engine HTTP 404: The model `missing` does not exist." {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestResultIDsUnique(t *testing.T) {
+	c, _ := New(Target{Engine: "vllm", URL: "http://127.0.0.1:1"})
+	seen := map[string]bool{}
+	for i := 0; i < 1000; i++ {
+		r, _ := c.Generate(context.Background(), "m", "p", 0)
+		if seen[r.ID] {
+			t.Fatalf("duplicate result ID %s", r.ID)
+		}
+		seen[r.ID] = true
+	}
+}

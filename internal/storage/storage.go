@@ -17,7 +17,7 @@ var ErrNotFound = errors.New("not found")
 type Store struct{ db *sql.DB }
 
 func Open(path string) (*Store, error) {
-	if path != " :memory:" && path != ":memory:" {
+	if path != ":memory:" {
 		if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 			return nil, err
 		}
