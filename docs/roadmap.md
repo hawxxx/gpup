@@ -6,7 +6,7 @@ Engine integration means OpenAI-compatible model discovery and chat completion o
 
 NVIDIA collection uses dynamically loaded NVML in cgo builds, nvidia-smi fallback, and optional bounded DCGM supplements. Docker builds disable cgo, so native NVML is not available in the provided image. NVLink rates, token-level ITL, and unsupported GPU metrics remain unavailable. Basic collection was exercised on an RTX 5090; independent accuracy checks and workload overhead acceptance targets remain unverified.
 
-Benchmarks vary client concurrency with bounded requests and deadlines. `sweep` does not tune batch sizes, scheduler policy, quantization, tensor parallelism, or engine deployment. `profile` records passive samples. Comparison requires compatible workloads and reports threshold failures. Prompt text and API keys are not persisted.
+Benchmarks vary client concurrency (closed loop) or offered Poisson request rate with an in-flight cap (open loop), with bounded requests and deadlines, optional SLO goodput, and per-point error classes. `sweep` does not tune batch sizes, scheduler policy, quantization, tensor parallelism, or engine deployment. `profile` records passive samples. Comparison requires compatible workloads and reports threshold failures. Prompt text and API keys are not persisted.
 
 Docker, Compose, systemd, and Helm examples package a single local instance. Helm persistence is SQLite on a single replica. Distributed node collectors, cluster-wide aggregation, remote GPU discovery, multiuser RBAC/OIDC, automatic tuning, Nsight integration, AMD/Intel GPU support, and fleet orchestration are deferred. Packaging templates are starting points for operator verification, not a production certification.
 
