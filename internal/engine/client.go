@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"gpup/internal/promtext"
@@ -47,8 +49,10 @@ type Result struct {
 	InputTokens  *int      `json:"inputTokens,omitempty"`
 	Status       string    `json:"status"`
 	Error        string    `json:"error,omitempty"`
-	ChunkGapsMs  []float64 `json:"chunkGapsMs,omitempty"`
-	Concurrency  int       `json:"concurrency,omitempty"`
+	// ErrorKind classifies failures; see the ErrorKind* constants.
+	ErrorKind   string    `json:"errorKind,omitempty"`
+	ChunkGapsMs []float64 `json:"chunkGapsMs,omitempty"`
+	Concurrency int       `json:"concurrency,omitempty"`
 }
 type Metric struct {
 	Value  float64 `json:"value"`
@@ -119,7 +123,9 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 		return nil, e
 	}
 	r.Header.Set("Content-Type", "application/json")
-	if c.Target.APIKeyEnv != "" {
+	// The credential belongs to the inference endpoint. A metrics URL on another
+	// origin (for example a separate exporter) never receives it.
+	if c.Target.APIKeyEnv != "" && sameOrigin(endpoint, c.Target.URL) {
 		key := os.Getenv(c.Target.APIKeyEnv)
 		if key == "" {
 			return nil, fmt.Errorf("credential environment variable %s is unset", c.Target.APIKeyEnv)
@@ -132,12 +138,85 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer resp.Body.Close()
-		if detail := errorDetail(resp.Body); detail != "" {
-			return nil, fmt.Errorf("engine HTTP %d: %s", resp.StatusCode, detail)
-		}
-		return nil, fmt.Errorf("engine HTTP %d", resp.StatusCode)
+		return nil, &HTTPError{Status: resp.StatusCode, Detail: errorDetail(resp.Body)}
 	}
 	return resp, nil
+}
+
+// HTTPError reports a non-2xx engine response.
+type HTTPError struct {
+	Status int
+	Detail string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("engine HTTP %d: %s", e.Status, e.Detail)
+	}
+	return fmt.Sprintf("engine HTTP %d", e.Status)
+}
+
+// Error kinds group failed requests so benchmark points can report why they
+// failed without parsing free-form messages.
+const (
+	ErrorKindHTTP4xx    = "http_4xx"
+	ErrorKindHTTP5xx    = "http_5xx"
+	ErrorKindTimeout    = "timeout"
+	ErrorKindConnection = "connection"
+	ErrorKindStream     = "stream_error"
+	ErrorKindTruncated  = "truncated"
+	ErrorKindMalformed  = "malformed"
+	ErrorKindOther      = "other"
+)
+
+var (
+	errStreamTruncated = errors.New("truncated SSE stream: missing [DONE]")
+	errStreamMalformed = errors.New("malformed SSE JSON")
+	errStreamEngine    = errors.New("engine returned stream error")
+)
+
+// ClassifyError maps a Generate error to one of the ErrorKind constants.
+func ClassifyError(err error) string {
+	var httpErr *HTTPError
+	var netErr net.Error
+	switch {
+	case err == nil:
+		return ""
+	case errors.As(err, &httpErr) && httpErr.Status >= 400 && httpErr.Status < 500:
+		return ErrorKindHTTP4xx
+	case errors.As(err, &httpErr):
+		return ErrorKindHTTP5xx
+	case errors.Is(err, errStreamTruncated):
+		return ErrorKindTruncated
+	case errors.Is(err, errStreamMalformed), errors.Is(err, bufio.ErrTooLong):
+		return ErrorKindMalformed
+	case errors.Is(err, errStreamEngine):
+		return ErrorKindStream
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &netErr) && netErr.Timeout():
+		return ErrorKindTimeout
+	case errors.As(err, &netErr), errors.Is(err, io.ErrUnexpectedEOF), errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.ECONNREFUSED):
+		return ErrorKindConnection
+	}
+	return ErrorKindOther
+}
+
+// sameOrigin reports whether two absolute URLs share scheme and host:port.
+func sameOrigin(a, b string) bool {
+	x, errA := url.Parse(a)
+	y, errB := url.Parse(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if u.Scheme == "https" {
+			return "443"
+		}
+		return "80"
+	}
+	return strings.EqualFold(x.Scheme, y.Scheme) && strings.EqualFold(x.Hostname(), y.Hostname()) && port(x) == port(y)
 }
 
 // errorDetail extracts a short, single-line message from an engine error body.
@@ -210,6 +289,7 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 		result.DurationMs = float64(time.Since(start)) / float64(time.Millisecond)
 		if err != nil {
 			result.Error = err.Error()
+			result.ErrorKind = ClassifyError(err)
 		} else {
 			result.Status = "ok"
 		}
@@ -255,13 +335,13 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 			Error json.RawMessage `json:"error"`
 		}
 		if e := json.Unmarshal([]byte(data), &chunk); e != nil {
-			return result, fmt.Errorf("malformed SSE JSON: %w", e)
+			return result, fmt.Errorf("%w: %v", errStreamMalformed, e)
 		}
 		if len(chunk.Error) > 0 && string(chunk.Error) != "null" {
 			if detail := errorDetail(strings.NewReader(`{"error":` + string(chunk.Error) + `}`)); detail != "" {
-				return result, fmt.Errorf("engine returned stream error: %s", detail)
+				return result, fmt.Errorf("%w: %s", errStreamEngine, detail)
 			}
-			return result, errors.New("engine returned stream error")
+			return result, errStreamEngine
 		}
 		if chunk.Usage != nil {
 			if chunk.Usage.Prompt != nil && *chunk.Usage.Prompt >= 0 {
@@ -292,7 +372,7 @@ func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens i
 		return result, e
 	}
 	if !done {
-		return result, errors.New("truncated SSE stream: missing [DONE]")
+		return result, errStreamTruncated
 	}
 	if result.OutputTokens != nil && *result.OutputTokens > 1 && result.TTFTMs != nil {
 		v := (lastContentMs - *result.TTFTMs) / float64(*result.OutputTokens-1)
@@ -339,11 +419,21 @@ func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 		if !ok {
 			continue
 		}
-		key := normalized
-		if _, exists := out[key]; exists {
-			key = normalized + "/" + sample.Name + sample.Labels
+		current, exists := out[normalized]
+		switch {
+		case !exists:
+			out[normalized] = Metric{sample.Value, sample.Name}
+		case current.Source != sample.Name:
+			// Engines may export a deprecated alias beside its replacement;
+			// combining both would double count, so the first series wins.
+		case normalized == "kvCacheFraction":
+			// Data-parallel ranks and multiple models report one series each.
+			// Occupancy is not additive; the most pressured rank is reported.
+			out[normalized] = Metric{max(current.Value, sample.Value), sample.Name}
+		default:
+			// Request counts and token counters are additive across ranks.
+			out[normalized] = Metric{current.Value + sample.Value, sample.Name}
 		}
-		out[key] = Metric{sample.Value, sample.Name}
 	}
 	return out, scanner.Err()
 }
