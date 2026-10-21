@@ -46,3 +46,9 @@ func TestParsesCIGatesAndRejectsUnknownRules(t *testing.T) {
 		}
 	}
 }
+
+func TestSameEndpointIgnoresVersionSuffix(t *testing.T) {
+	if !sameEndpoint("http://127.0.0.1:8000/v1", "http://127.0.0.1:8000/") || sameEndpoint("http://127.0.0.1:8000", "http://127.0.0.1:8001") {
+		t.Fatal("endpoint normalization mismatch")
+	}
+}

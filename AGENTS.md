@@ -31,6 +31,6 @@ No testing framework or coverage threshold is configured. For future live increm
 
 ## Commit & Pull Request Guidelines
 
-This checkout has no Git metadata, so no historical commit convention can be verified. Use concise, imperative commit subjects describing the change.
+Use [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, ...) with concise, imperative subjects. PR titles are checked in CI and become the squash commit that release-please uses for versioning and `CHANGELOG.md`; do not edit versions or the changelog by hand.
 
 Pull requests should explain the problem, resulting behavior, and verification performed. Link relevant issues and design documents; include screenshots for interface changes. Clearly distinguish prototype changes from implemented telemetry integration.

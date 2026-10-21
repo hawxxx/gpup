@@ -60,7 +60,7 @@ Run the same workload before and after a change to your inference server:
   --save optimized --compare baseline --max-throughput-drop 10 --max-latency-increase 20
 ```
 
-`--duration` applies to each concurrency point. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
+`--duration` applies to each concurrency point. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
 
 You can also sweep concurrency, capture passive telemetry, or compare existing runs:
 
@@ -115,6 +115,10 @@ NVML collection requires a cgo build and a usable NVIDIA driver. Builds with `CG
 | `make docker` | Build the `gpup:local` Docker image |
 
 For frontend development, run `./bin/gpup serve` and `make dev` in separate terminals after building. Open the URL printed by Vite; it proxies `/api` requests to `http://127.0.0.1:7331`.
+
+### Releases
+
+Pull requests are squash-merged, and their titles must follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, ...); a CI check enforces this. [release-please](https://github.com/googleapis/release-please) reads those commits on `main` and keeps a release pull request open that bumps the version in `internal/app/app.go`, `web/package.json` and the Helm chart, and updates `CHANGELOG.md`. Merging it tags `vX.Y.Z`, creates the GitHub release, and publishes a signed multi-arch image to `ghcr.io/hawxxx/gpup` after a Trivy scan. Dependabot opens weekly updates for Go modules, npm packages, Docker base images and GitHub Actions.
 
 ## Deployment
 

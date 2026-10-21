@@ -21,7 +21,7 @@ import (
 	"gpup/internal/storage"
 )
 
-const Version = "0.1.0"
+const Version = "0.1.0" // x-release-please-version
 
 type SnapshotPoint struct {
 	Time            time.Time `json:"time"`
@@ -46,10 +46,18 @@ type Snapshot struct {
 	System          map[string]any  `json:"system"`
 }
 type Job struct {
-	ID     string     `json:"id"`
-	Status string     `json:"status"`
-	Error  string     `json:"error,omitempty"`
-	Run    *bench.Run `json:"run,omitempty"`
+	ID       string       `json:"id"`
+	Status   string       `json:"status"`
+	Error    string       `json:"error,omitempty"`
+	Run      *bench.Run   `json:"run,omitempty"`
+	Progress *JobProgress `json:"progress,omitempty"`
+}
+
+// JobProgress summarizes requests completed so far by a running benchmark.
+type JobProgress struct {
+	Concurrency int `json:"concurrency"`
+	Requests    int `json:"requests"`
+	Errors      int `json:"errors"`
 }
 type GPUSample struct {
 	Time  time.Time `json:"time"`
@@ -254,6 +262,10 @@ func (a *App) Job(id string) (Job, error) {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	j, ok := a.jobs[id]
+	if ok && j.Progress != nil {
+		p := *j.Progress
+		j.Progress = &p
+	}
 	if ok && j.Status != "running" {
 		var full bench.Run
 		if err := a.store.Get("run", id, &full); err == nil {
@@ -310,7 +322,7 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 	id := ID("run")
 	ctx, cancel := context.WithCancel(a.ctx)
 	a.cancels[id] = cancel
-	a.jobs[id] = Job{ID: id, Status: "running"}
+	a.jobs[id] = Job{ID: id, Status: "running", Progress: &JobProgress{Concurrency: c.Concurrency[0]}}
 	safeConfig := c
 	safeConfig.Prompt = ""
 	a.state.Runs = append([]bench.Run{{ID: id, Name: c.Name, TargetID: t.ID, Model: c.Model, StartedAt: time.Now(), Status: "running", Config: safeConfig, Points: []bench.Point{}, Findings: []bench.Finding{}}}, a.state.Runs...)
@@ -319,7 +331,23 @@ func (a *App) StartBenchmark(parent context.Context, c bench.Config) (string, er
 	go func() {
 		defer a.wg.Done()
 		defer cancel()
-		run, runErr := bench.RunBenchmark(ctx, client, c, a.recordRequest)
+		run, runErr := bench.RunBenchmark(ctx, client, c, func(r engine.Result) {
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			a.recordRequestLocked(r)
+			if j, ok := a.jobs[id]; ok && j.Progress != nil {
+				p := *j.Progress
+				if r.Concurrency != p.Concurrency {
+					p = JobProgress{Concurrency: r.Concurrency}
+				}
+				p.Requests++
+				if r.Status != "ok" {
+					p.Errors++
+				}
+				j.Progress = &p
+				a.jobs[id] = j
+			}
+		})
 		run.ID = id
 		run.Knee = analysis.DetectKnee(run.Points)
 		a.mu.Lock()
@@ -438,6 +466,7 @@ func (a *App) Poll(ctx context.Context) {
 	if err := a.refreshStoredData(); err != nil {
 		a.mu.Lock()
 		a.state.CollectorErrors = []string{"storage refresh: " + err.Error()}
+		a.revision++
 		a.mu.Unlock()
 		return
 	}
@@ -494,14 +523,15 @@ func (a *App) Poll(ctx context.Context) {
 				metrics[t.ID] = values
 				for k, v := range values {
 					val := v.Value
+					// With several targets, history reports the most pressured one.
 					switch k {
 					case "kvCacheFraction":
 						val *= 100
-						observation.KVCachePercent = &val
+						observation.KVCachePercent = maxValue(observation.KVCachePercent, val)
 					case "requestsWaiting":
-						observation.RequestsWaiting = &val
+						observation.RequestsWaiting = maxValue(observation.RequestsWaiting, val)
 					case "preemptionsTotal":
-						observation.Evictions = &val
+						observation.Evictions = maxValue(observation.Evictions, val)
 					}
 				}
 			}
@@ -577,6 +607,13 @@ func (a *App) Poll(ctx context.Context) {
 	a.mu.Unlock()
 	_ = a.store.AddSnapshot(point.Time, map[string]any{"point": point, "gpus": devices, "metrics": metrics})
 	_ = a.store.Prune(24*time.Hour, 200)
+}
+
+func maxValue(current *float64, v float64) *float64 {
+	if current != nil && *current >= v {
+		return current
+	}
+	return &v
 }
 
 // Keep the shared SQLite workspace coherent across independent CLI and daemon processes.

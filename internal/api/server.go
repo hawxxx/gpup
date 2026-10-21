@@ -16,6 +16,7 @@ import (
 	"gpup/internal/app"
 	"gpup/internal/bench"
 	"gpup/internal/engine"
+	"gpup/internal/gpu"
 	"gpup/internal/storage"
 )
 
@@ -27,13 +28,39 @@ func Handler(a *app.App, assets fs.FS, opt Options) http.Handler {
 	r.Get("/metrics", Secure(opt, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := a.Snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-		fmt.Fprintf(w, "# HELP gpup_targets Configured inference targets.\n# TYPE gpup_targets gauge\ngpup_targets %d\n# TYPE gpup_observed_requests gauge\ngpup_observed_requests %d\n", len(s.Targets), len(s.Requests))
-		for _, g := range s.GPUs {
-			if g.Utilization != nil {
-				fmt.Fprintf(w, "gpup_gpu_utilization_percent{gpu=%q} %g\n", g.UUID, *g.Utilization)
+		fmt.Fprintf(w, "# HELP gpup_targets Configured inference targets.\n# TYPE gpup_targets gauge\ngpup_targets %d\n# HELP gpup_observed_requests Retained GPUP-generated request records.\n# TYPE gpup_observed_requests gauge\ngpup_observed_requests %d\n", len(s.Targets), len(s.Requests))
+		if len(s.Targets) > 0 {
+			fmt.Fprint(w, "# HELP gpup_target_up Whether the target answered model discovery on the last poll.\n# TYPE gpup_target_up gauge\n")
+			for _, t := range s.Targets {
+				up := 0
+				if t.Status == "healthy" {
+					up = 1
+				}
+				fmt.Fprintf(w, "gpup_target_up{target=\"%s\"} %d\n", promLabel(t.Name), up)
 			}
-			if g.PowerW != nil {
-				fmt.Fprintf(w, "gpup_gpu_power_watts{gpu=%q} %g\n", g.UUID, *g.PowerW)
+		}
+		gauges := []struct {
+			name, help string
+			value      func(gpu.GPU) *float64
+		}{
+			{"gpup_gpu_utilization_percent", "GPU utilization percent.", func(g gpu.GPU) *float64 { return g.Utilization }},
+			{"gpup_gpu_memory_used_megabytes", "GPU memory used in MiB.", func(g gpu.GPU) *float64 { return g.MemoryUsedMB }},
+			{"gpup_gpu_memory_total_megabytes", "GPU memory capacity in MiB.", func(g gpu.GPU) *float64 { return g.MemoryTotalMB }},
+			{"gpup_gpu_temperature_celsius", "GPU temperature in degrees Celsius.", func(g gpu.GPU) *float64 { return g.TemperatureC }},
+			{"gpup_gpu_power_watts", "GPU power draw in watts.", func(g gpu.GPU) *float64 { return g.PowerW }},
+		}
+		for _, gauge := range gauges {
+			header := false
+			for _, g := range s.GPUs {
+				v := gauge.value(g)
+				if v == nil {
+					continue
+				}
+				if !header {
+					fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n", gauge.name, gauge.help, gauge.name)
+					header = true
+				}
+				fmt.Fprintf(w, "%s{gpu=\"%s\",index=\"%d\"} %g\n", gauge.name, promLabel(g.UUID), g.Index, *v)
 			}
 		}
 	})).ServeHTTP)
@@ -239,6 +266,11 @@ func Handler(a *app.App, assets fs.FS, opt Options) http.Handler {
 	})
 	// Security headers apply to public static content; API authentication happens inside its router.
 	return Secure(Options{PublicStatic: true}, r)
+}
+
+// promLabel escapes a Prometheus label value; Go %q escaping is not equivalent.
+func promLabel(v string) string {
+	return strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`).Replace(v)
 }
 func write(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

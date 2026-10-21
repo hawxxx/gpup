@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gpup/internal/promtext"
 )
 
 type GPU struct {
@@ -158,20 +160,22 @@ func (c *Collector) supplement(ctx context.Context, devices []GPU) error {
 }
 func supplementDCGM(body string, devices []GPU) {
 	for _, line := range strings.Split(body, "\n") {
-		parts := strings.Fields(line)
-		if len(parts) < 2 || strings.HasPrefix(parts[0], "#") {
+		// Exporter labels such as modelName="NVIDIA GeForce RTX 4090" contain spaces.
+		sample, ok := promtext.ParseLine(line)
+		v := sample.Value
+		if !ok || v < 0 || v > 1e15 {
 			continue
 		}
-		v, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v > 1e15 {
+		uuid, ok := sample.Label("UUID")
+		if !ok || uuid == "" {
 			continue
 		}
 		for i := range devices {
 			g := &devices[i]
-			if !strings.Contains(parts[0], `UUID="`+g.UUID+`"`) {
+			if g.UUID != uuid {
 				continue
 			}
-			switch strings.Split(parts[0], "{")[0] {
+			switch sample.Name {
 			case "DCGM_FI_DEV_XID_ERRORS":
 				n := uint64(v)
 				g.XIDErrors = &n

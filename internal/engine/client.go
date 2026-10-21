@@ -8,13 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
+
+	"gpup/internal/promtext"
 )
 
 type Target struct {
@@ -65,6 +67,22 @@ type Client struct {
 	Capabilities Capabilities
 }
 
+// streamTransport is shared so per-poll clients reuse connections. It bounds the
+// wait for response headers only: streamed generations may legitimately run
+// longer than any fixed total timeout and are bounded by their context instead.
+var streamTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 120 * time.Second
+	return t
+}()
+
+// requestSequence keeps result IDs unique when concurrent requests start within
+// the same clock tick, which is common on coarse-resolution clocks.
+var requestSequence atomic.Uint64
+
+// defaultTimeout bounds non-streaming calls whose caller set no deadline.
+const defaultTimeout = 30 * time.Second
+
 func New(t Target) (*Client, error) {
 	if e := validURL(t.URL); e != nil {
 		return nil, e
@@ -79,7 +97,7 @@ func New(t Target) (*Client, error) {
 	default:
 		return nil, fmt.Errorf("unsupported engine %q", t.Engine)
 	}
-	return &Client{Target: t, HTTP: &http.Client{Timeout: 120 * time.Second}, Capabilities: Capabilities{"OpenAI-compatible chat completions", true, true, t.MetricsURL != "", "Requires the engine's OpenAI-compatible endpoint; native APIs and token boundaries are unavailable."}}, nil
+	return &Client{Target: t, HTTP: &http.Client{Transport: streamTransport}, Capabilities: Capabilities{"OpenAI-compatible chat completions", true, true, t.MetricsURL != "", "Requires the engine's OpenAI-compatible endpoint; native APIs and token boundaries are unavailable."}}, nil
 }
 func validURL(raw string) error {
 	u, e := url.Parse(raw)
@@ -113,12 +131,57 @@ func (c *Client) request(ctx context.Context, method, endpoint string, body io.R
 		return nil, e
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		resp.Body.Close()
+		defer resp.Body.Close()
+		if detail := errorDetail(resp.Body); detail != "" {
+			return nil, fmt.Errorf("engine HTTP %d: %s", resp.StatusCode, detail)
+		}
 		return nil, fmt.Errorf("engine HTTP %d", resp.StatusCode)
 	}
 	return resp, nil
 }
+
+// errorDetail extracts a short, single-line message from an engine error body.
+func errorDetail(body io.Reader) string {
+	raw, _ := io.ReadAll(io.LimitReader(body, 4096))
+	var payload struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  string          `json:"detail"`
+	}
+	text := ""
+	if json.Unmarshal(raw, &payload) == nil {
+		var nested struct {
+			Message string `json:"message"`
+		}
+		var plain string
+		switch {
+		case json.Unmarshal(payload.Error, &nested) == nil && nested.Message != "":
+			text = nested.Message
+		case json.Unmarshal(payload.Error, &plain) == nil && plain != "":
+			text = plain
+		case payload.Message != "":
+			text = payload.Message
+		case payload.Detail != "":
+			text = payload.Detail
+		}
+	} else if !bytes.HasPrefix(bytes.TrimSpace(raw), []byte("<")) {
+		text = string(raw)
+	}
+	text = strings.Join(strings.Fields(text), " ")
+	if r := []rune(text); len(r) > 200 {
+		text = string(r[:200]) + "…"
+	}
+	return text
+}
+func withDefaultTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, defaultTimeout)
+}
 func (c *Client) Discover(ctx context.Context) ([]Model, error) {
+	ctx, cancel := withDefaultTimeout(ctx)
+	defer cancel()
 	resp, e := c.request(ctx, "GET", c.endpoint("/models"), nil)
 	if e != nil {
 		return nil, e
@@ -142,7 +205,7 @@ func (c *Client) Discover(ctx context.Context) ([]Model, error) {
 }
 func (c *Client) Generate(ctx context.Context, model, prompt string, maxTokens int) (result Result, err error) {
 	start := time.Now()
-	result = Result{ID: strconv.FormatInt(start.UnixNano(), 36), TargetID: c.Target.ID, Model: model, StartedAt: start, Status: "error"}
+	result = Result{ID: strconv.FormatInt(start.UnixNano(), 36) + "-" + strconv.FormatUint(requestSequence.Add(1), 36), TargetID: c.Target.ID, Model: model, StartedAt: start, Status: "error"}
 	defer func() {
 		result.DurationMs = float64(time.Since(start)) / float64(time.Millisecond)
 		if err != nil {
@@ -235,6 +298,8 @@ func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 	if c.Target.MetricsURL == "" {
 		return out, errors.New("metrics endpoint not configured")
 	}
+	ctx, cancel := withDefaultTimeout(ctx)
+	defer cancel()
 	resp, e := c.request(ctx, "GET", c.Target.MetricsURL, nil)
 	if e != nil {
 		return out, e
@@ -242,24 +307,21 @@ func (c *Client) Scrape(ctx context.Context) (map[string]Metric, error) {
 	defer resp.Body.Close()
 	names := map[string]string{"vllm:num_requests_running": "requestsRunning", "vllm:num_requests_waiting": "requestsWaiting", "vllm:gpu_cache_usage_perc": "kvCacheFraction", "vllm:kv_cache_usage_perc": "kvCacheFraction", "vllm:prompt_tokens_total": "inputTokensTotal", "vllm:generation_tokens_total": "outputTokensTotal", "vllm:num_preemptions_total": "preemptionsTotal"}
 	scanner := bufio.NewScanner(io.LimitReader(resp.Body, 4<<20))
+	scanner.Buffer(make([]byte, 4096), 1<<20)
 	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if len(fields) < 2 || strings.HasPrefix(fields[0], "#") {
-			continue
-		}
-		name := strings.SplitN(fields[0], "{", 2)[0]
-		normalized, ok := names[name]
+		sample, ok := promtext.ParseLine(scanner.Text())
 		if !ok {
 			continue
 		}
-		v, e := strconv.ParseFloat(fields[1], 64)
-		if e == nil && !math.IsNaN(v) && !math.IsInf(v, 0) {
-			key := normalized
-			if _, exists := out[key]; exists {
-				key = normalized + "/" + fields[0]
-			}
-			out[key] = Metric{v, name}
+		normalized, ok := names[sample.Name]
+		if !ok {
+			continue
 		}
+		key := normalized
+		if _, exists := out[key]; exists {
+			key = normalized + "/" + sample.Name + sample.Labels
+		}
+		out[key] = Metric{sample.Value, sample.Name}
 	}
 	return out, scanner.Err()
 }

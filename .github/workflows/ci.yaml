@@ -1,0 +1,104 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      web: ${{ steps.filter.outputs.web }}
+      packaging: ${{ steps.filter.outputs.packaging }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/ci_changes.py
+  go:
+    needs: changes
+    # Missing outputs (including detection failure) run checks conservatively.
+    if: ${{ !cancelled() && needs.changes.outputs.go != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.10'
+          cache-dependency-path: go.sum
+      - run: test -z "$(gofmt -l cmd internal benchmarks web)" || { gofmt -l cmd internal benchmarks web; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+  web:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.web != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --audit-level=high
+  packaging:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.packaging != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: azure/setup-helm@v5.0.1
+        with:
+          version: v3.17.2
+      - run: helm lint deploy/helm/gpup
+      - run: helm template gpup deploy/helm/gpup > /tmp/gpup.yaml
+      - run: GPUP_API_TOKEN=configuration-only docker compose -f deploy/docker/compose.yaml config --quiet
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+      - name: Build and load smoke-test image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          load: true
+          tags: gpup:ci
+          cache-from: type=gha,scope=ci-packaging
+          cache-to: type=gha,scope=ci-packaging,mode=max,ignore-error=true
+      - name: Start read-only non-root image
+        run: docker run -d --name gpup-smoke --read-only --cap-drop ALL --security-opt no-new-privileges --tmpfs /data:uid=10001,gid=10001 -e GPUP_API_TOKEN=ci-only -p 127.0.0.1:17331:7331 gpup:ci
+      - name: Verify image health and embedded dashboard
+        run: |
+          for attempt in $(seq 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:17331/healthz && break
+            [ "$attempt" = 30 ] && { echo "Image did not become healthy"; exit 1; }
+            sleep 1
+          done
+          curl -fsS --max-time 5 http://127.0.0.1:17331/ | grep -q '<html' || { echo "Dashboard HTML missing"; exit 1; }
+          echo "Read-only image health and embedded dashboard passed"
+      - if: always()
+        run: docker logs gpup-smoke && docker rm -f gpup-smoke

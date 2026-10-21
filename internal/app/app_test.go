@@ -45,12 +45,19 @@ func TestTargetRunPersistenceAndPrivacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sawProgress := false
 	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
 		j, err := a.Job(id)
 		if err != nil {
 			t.Fatal(err)
 		}
+		if j.Status == "running" && j.Progress != nil && j.Progress.Concurrency == 2 {
+			sawProgress = true
+		}
 		if j.Status != "running" {
+			if !sawProgress {
+				t.Fatal("running job reported no progress")
+			}
 			if j.Run == nil || j.Run.Config.Prompt != "" || len(j.Run.Points) != 1 {
 				t.Fatalf("run privacy %+v", j)
 			}

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"gpup/internal/app"
+	"gpup/internal/engine"
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
@@ -123,5 +124,22 @@ func TestStoppingAppClosesLiveStream(t *testing.T) {
 	}
 	if ctx.Err() != nil {
 		t.Fatal("stream outlived application shutdown")
+	}
+}
+
+func TestPrometheusExpositionEscapesLabels(t *testing.T) {
+	a, err := app.New(filepath.Join(t.TempDir(), "api.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err = a.AddTarget(context.Background(), engine.Target{Name: `say "hi"`, Engine: "openai", URL: "http://127.0.0.1:1/v1"}); err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	Handler(a, fstest.MapFS{}, Options{}).ServeHTTP(w, httptest.NewRequest("GET", "http://localhost/metrics", nil))
+	body := w.Body.String()
+	if !strings.Contains(body, "# TYPE gpup_target_up gauge\n") || !strings.Contains(body, `gpup_target_up{target="say \"hi\""} 0`) {
+		t.Fatalf("unexpected exposition:\n%s", body)
 	}
 }
