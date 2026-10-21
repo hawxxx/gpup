@@ -33,6 +33,7 @@ GPUP is a single-operator tool. It sends traffic to inference endpoints that its
 - Engine error text (up to 200 characters) and target health appear in snapshots, so authenticated readers can see short responses from registered endpoints.
 - Without TLS (`--tls-cert`, `--tls-key`) or a TLS-terminating proxy, the token travels in clear text. Bind remotely only behind TLS.
 - IPv6 unique-local metadata addresses, such as AWS `fd00:ec2::254`, are not link-local and are not blocked. Block them with network policy where needed.
+- With `HTTP_PROXY` or `HTTPS_PROXY` set, engine requests go through the proxy, and the link-local check applies to the proxy address rather than the final destination. Enforce egress rules on the proxy.
 - The GPU collector runs `nvidia-smi` from `PATH` with fixed arguments; no user input reaches the command line.
 - `/healthz` is unauthenticated and reveals the version.
 
