@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -15,6 +18,15 @@ type Options struct {
 	TLSCert      string
 	TLSKey       string
 	PublicStatic bool
+}
+
+const sessionCookie = "gpup_session"
+
+// sessionValue derives the browser session cookie from the API token.
+func sessionValue(token string) string {
+	mac := hmac.New(sha256.New, []byte(token))
+	mac.Write([]byte("gpup browser session v1"))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func ValidateBind(addr, token string) error {
@@ -47,17 +59,21 @@ func Secure(opt Options, next http.Handler) http.Handler {
 			}
 		}
 		if opt.Token != "" {
-			auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if c, err := r.Cookie("gpup_session"); err == nil && auth == "" {
-				auth = c.Value
+			session := sessionValue(opt.Token)
+			header := r.Header.Get("Authorization")
+			ok := header != "" && subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(header, "Bearer ")), []byte(opt.Token)) == 1
+			if c, err := r.Cookie(sessionCookie); err == nil && header == "" {
+				ok = subtle.ConstantTimeCompare([]byte(c.Value), []byte(session)) == 1
 			}
-			if subtle.ConstantTimeCompare([]byte(auth), []byte(opt.Token)) != 1 {
+			if !ok {
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
-			// An authenticated initial browser request establishes an HttpOnly same-origin SSE session.
-			if r.Header.Get("Authorization") != "" {
-				http.SetCookie(w, &http.Cookie{Name: "gpup_session", Value: opt.Token, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
+			// An authenticated initial browser request establishes an HttpOnly
+			// same-origin SSE session. The cookie holds a value derived from the
+			// token, so it cannot be replayed as a bearer token.
+			if header != "" {
+				http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: session, Path: "/", HttpOnly: true, Secure: r.TLS != nil, SameSite: http.SameSiteStrictMode})
 			}
 		}
 		if r.Method != "GET" && r.Method != "HEAD" && r.Method != "OPTIONS" {

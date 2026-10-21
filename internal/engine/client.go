@@ -79,8 +79,27 @@ type Client struct {
 var streamTransport = func() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 120 * time.Second
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, Control: refuseLinkLocal}
+	t.DialContext = dialer.DialContext
 	return t
 }()
+
+// errLinkLocal blocks requests to link-local addresses, which host cloud
+// instance-metadata services (169.254.169.254) and are never inference
+// endpoints. It is checked on the resolved address, so DNS names that resolve
+// to these ranges are refused too.
+var errLinkLocal = errors.New("refusing to connect to a link-local or unspecified address")
+
+func refuseLinkLocal(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()) {
+		return errLinkLocal
+	}
+	return nil
+}
 
 // requestSequence keeps result IDs unique when concurrent requests start within
 // the same clock tick, which is common on coarse-resolution clocks.

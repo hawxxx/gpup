@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -310,4 +311,21 @@ func FuzzGenerateStream(f *testing.F) {
 			t.Fatalf("TPOT without at least two reported tokens: %+v", r)
 		}
 	})
+}
+
+func TestTransportRefusesLinkLocalAddresses(t *testing.T) {
+	for _, address := range []string{"169.254.169.254:80", "[fe80::1]:80", "0.0.0.0:80", "[::]:80"} {
+		if !errors.Is(refuseLinkLocal("tcp", address, nil), errLinkLocal) {
+			t.Errorf("%s was not refused", address)
+		}
+	}
+	for _, address := range []string{"127.0.0.1:8000", "10.0.0.5:8000", "[::1]:8000"} {
+		if err := refuseLinkLocal("tcp", address, nil); err != nil {
+			t.Errorf("%s refused: %v", address, err)
+		}
+	}
+	c, _ := New(Target{Engine: "vllm", URL: "http://169.254.169.254/v1"})
+	if _, err := c.Discover(context.Background()); err == nil || !strings.Contains(err.Error(), "link-local") {
+		t.Fatalf("metadata address reachable: %v", err)
+	}
 }
