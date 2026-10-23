@@ -1,6 +1,9 @@
 package promtext
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestParseLineWithSpacedLabels(t *testing.T) {
 	s, ok := ParseLine(`DCGM_FI_DEV_XID_ERRORS{gpu="0",UUID="GPU-1",modelName="NVIDIA GeForce RTX 4090",note="a \"}\" b"} 3 1700000000000`)
@@ -30,4 +33,16 @@ func TestParseLineRejectsInvalid(t *testing.T) {
 	if s, ok := ParseLine("vllm:num_requests_running 2"); !ok || s.Value != 2 || s.Labels != "" {
 		t.Fatalf("unlabelled sample: %+v %v", s, ok)
 	}
+}
+
+func FuzzParseLine(f *testing.F) {
+	for _, seed := range []string{`a{b="c d}"} 1 2`, `x 1e3`, `# HELP x`, `y{z="\"}"} NaN`, `m{`, "n\t+Inf"} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, line string) {
+		s, ok := ParseLine(line)
+		if ok && (s.Name == "" || math.IsNaN(s.Value) || math.IsInf(s.Value, 0)) {
+			t.Fatalf("accepted invalid sample %+v from %q", s, line)
+		}
+	})
 }

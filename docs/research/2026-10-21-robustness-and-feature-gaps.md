@@ -24,17 +24,33 @@ This review compares GPUP with common inference benchmarking and observability t
 | Dashboard | A running benchmark showed "0 operating points" with no progress. | Snapshots include active job progress; the dashboard shows point, concurrency, request, and error counts. |
 | Dashboard | The benchmark dialog required typing the model even when the target had one. | Selecting a target prefills its default or discovered model. |
 
+## Second pass (October 21, 2026)
+
+| Area | Problem | Resolution |
+| --- | --- | --- |
+| Load model | Only closed-loop concurrency sweeps existed, which hide queueing delay. | `--request-rate` runs open-loop Poisson arrivals with an in-flight cap, reports delayed arrivals, and flags the first unsustained rate. |
+| Cool-down | Requests in flight at a point's deadline were silently discarded. | They are still excluded from statistics but counted as `incomplete` ("cut off"). |
+| Goodput | No SLO reporting. | `--slo-ttft`, `--slo-tpot`, `--slo-e2e` report goodput per point; `--fail-if 'goodput<95%'` gates CI. |
+| Failure taxonomy | Errors were free-form strings. | Requests carry an `errorKind`; points count failures per class; the dashboard and CLI show the breakdown. |
+| Duplicate run names | Saving over a name was silent. | The CLI warns that name lookups now resolve to the new run. |
+| Exporter accuracy | With several label sets (data-parallel ranks, several models), only the first series counted. | Additive series are summed; KV-cache usage reports the highest rank; deprecated aliases are not double counted. |
+| Credentials | The target's API key was sent to metrics URLs on any host. | Sent only to the target's own origin. |
+| SSRF | Targets could reach link-local metadata services. | Link-local and unspecified addresses are refused after DNS resolution. |
+| Session cookie | The cookie held the raw API token. | It holds an HMAC derived from the token. |
+| Snapshot size | Every live snapshot carried each request's chunk-gap array; 2,000 requests produced 2.9 MB per update. | Gaps are dropped after aggregation: 0.59 MB, and `/api/v1/snapshot` latency fell from 61 ms to 8–17 ms on the same workspace. |
+| Accessibility | Secondary text and the light-theme accent failed WCAG AA contrast; scrollable tables were not keyboard reachable; 320 px layouts overflowed. | axe-core WCAG 2.2 AA reports no violations on any page in either theme; no page overflows from 320 to 1920 px. |
+
 ## Remaining gaps, ranked
 
-1. **Open-loop load (request rate).** GPUP only runs closed-loop concurrency sweeps. GuideLLM, GenAI-Perf, and vLLM's benchmark tool also offer fixed or Poisson request rates. Closed loops hide queueing delay because clients wait for responses. Add `--request-rate` with Poisson arrivals and report achieved versus offered rate.
-2. **Cool-down handling.** Requests still in flight at a point's deadline are discarded, which slightly favors short requests at high concurrency. Consider reporting their count.
+1. ~~**Open-loop load (request rate).**~~ Done in the second pass. GPUP only runs closed-loop concurrency sweeps. GuideLLM, GenAI-Perf, and vLLM's benchmark tool also offer fixed or Poisson request rates. Closed loops hide queueing delay because clients wait for responses. Add `--request-rate` with Poisson arrivals and report achieved versus offered rate.
+2. ~~**Cool-down handling.**~~ Cut-off requests are now counted. Requests still in flight at a point's deadline are discarded, which slightly favors short requests at high concurrency. Consider reporting their count.
 3. **Prompt datasets and length distributions.** One fixed prompt does not exercise prefix caching, batching, or context length realistically. Support JSONL prompt files, synthetic input/output length distributions, and `ignore_eos`-style fixed output lengths where the engine supports them. Hash the dataset, not the prompt text, for compatibility checks.
-4. **Goodput and SLO reporting.** Report the share of requests meeting TTFT and TPOT targets, as in DistServe goodput, plus a `--fail-if 'goodput<95%'` gate.
+4. ~~**Goodput and SLO reporting.**~~ Done in the second pass. Report the share of requests meeting TTFT and TPOT targets, as in DistServe goodput, plus a `--fail-if 'goodput<95%'` gate.
 5. **Token-level ITL.** Chunk-gap percentiles are now reported, but engines that batch tokens per chunk hide true inter-token latency. Engine-side histograms (for example vLLM's) could supply it where exposed.
-6. **Retry and failure taxonomy.** Classify errors by HTTP status, timeout, truncated stream, or engine error. Show counts per class in each point and the dashboard.
+6. ~~**Retry and failure taxonomy.**~~ Error classes are done; retries are intentionally not performed. Classify errors by HTTP status, timeout, truncated stream, or engine error. Show counts per class in each point and the dashboard.
 7. **Request detail drawer.** Errors are only visible as row tooltips. Add a detail drawer with the error, token counts, chunk-gap sparkline, and concurrency.
 8. **Alerting and notifications.** Findings are visible only in the UI. Expose them as Prometheus alerts or a webhook.
-9. **Duplicate run names.** Names are not unique; lookups resolve to the newest run. A `--replace` flag or uniqueness warning would make CI baselines less ambiguous.
+9. **Duplicate run names.** The CLI now warns. Names are not unique; lookups resolve to the newest run. A `--replace` flag or uniqueness warning would make CI baselines less ambiguous.
 10. **Persistent request history.** Only the latest two request chunks are reloaded; long-term request analysis requires a request table with indexed time queries.
 11. **Multi-instance aggregation.** Out of MVP scope, but the most requested capability for fleet operators.
 

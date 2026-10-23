@@ -2,9 +2,12 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -164,5 +167,165 @@ func TestScrapeEngineExporters(t *testing.T) {
 	}
 	if m["requestsRunning"].Value != 3 || m["kvCacheFraction"].Value != 0.5 || m["requestsWaiting"].Source != "sglang:num_queue_reqs" {
 		t.Fatalf("SGLang series not normalized: %+v", m)
+	}
+}
+
+func TestCredentialNotSentToForeignMetricsOrigin(t *testing.T) {
+	t.Setenv("GPUP_TEST_KEY", "secret")
+	seen := make(chan string, 2)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get("Authorization")
+		fmt.Fprint(w, "vllm:num_requests_running 1\n")
+	})
+	engineServer, exporter := httptest.NewServer(handler), httptest.NewServer(handler)
+	defer engineServer.Close()
+	defer exporter.Close()
+	for _, tc := range []struct{ metricsURL, want string }{
+		{engineServer.URL + "/metrics", "Bearer secret"},
+		{exporter.URL + "/metrics", ""},
+	} {
+		c, _ := New(Target{Engine: "vllm", URL: engineServer.URL + "/v1", APIKeyEnv: "GPUP_TEST_KEY", MetricsURL: tc.metricsURL})
+		if _, e := c.Scrape(context.Background()); e != nil {
+			t.Fatal(e)
+		}
+		if got := <-seen; got != tc.want {
+			t.Fatalf("%s received Authorization %q, want %q", tc.metricsURL, got, tc.want)
+		}
+	}
+}
+
+func TestSameOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"http://h:8000/metrics", "http://h:8000/v1", true},
+		{"http://H/metrics", "http://h:80/v1", true},
+		{"https://h/metrics", "https://h:443/v1", true},
+		{"http://h:9400/metrics", "http://h:8000/v1", false},
+		{"https://h:8000/metrics", "http://h:8000/v1", false},
+		{"http://evil/metrics", "http://h/v1", false},
+	} {
+		if got := sameOrigin(tc.a, tc.b); got != tc.want {
+			t.Errorf("sameOrigin(%q, %q) = %v", tc.a, tc.b, got)
+		}
+	}
+}
+
+func TestScrapeAggregatesRanksAndIgnoresAliases(t *testing.T) {
+	body := `vllm:num_requests_running{engine="0"} 3
+vllm:num_requests_running{engine="1"} 2
+vllm:kv_cache_usage_perc{engine="0"} 0.4
+vllm:kv_cache_usage_perc{engine="1"} 0.9
+vllm:gpu_cache_usage_perc{engine="0"} 0.1
+vllm:generation_tokens_total{engine="0"} 100
+vllm:generation_tokens_total{engine="1"} 50
+`
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, body) }))
+	defer s.Close()
+	c, _ := New(Target{Engine: "vllm", URL: s.URL, MetricsURL: s.URL + "/metrics"})
+	m, e := c.Scrape(context.Background())
+	if e != nil {
+		t.Fatal(e)
+	}
+	if m["requestsRunning"].Value != 5 || m["outputTokensTotal"].Value != 150 {
+		t.Fatalf("additive series not summed across ranks: %+v", m)
+	}
+	if m["kvCacheFraction"].Value != 0.9 || m["kvCacheFraction"].Source != "vllm:kv_cache_usage_perc" {
+		t.Fatalf("KV cache must report the most pressured rank of the first series: %+v", m)
+	}
+	if len(m) != 3 {
+		t.Fatalf("unexpected keys: %+v", m)
+	}
+}
+
+func TestGenerateClassifiesErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind string
+		handler    http.HandlerFunc
+	}{
+		{"rate limited", ErrorKindHTTP4xx, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(429) }},
+		{"server error", ErrorKindHTTP5xx, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }},
+		{"truncated", ErrorKindTruncated, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n\n")
+		}},
+		{"malformed", ErrorKindMalformed, func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, "data: {nope\n\n") }},
+		{"engine", ErrorKindStream, func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "data: {\"error\":{\"message\":\"oom\"}}\n\n")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := httptest.NewServer(tc.handler)
+			defer s.Close()
+			c, _ := New(Target{Engine: "vllm", URL: s.URL})
+			r, e := c.Generate(context.Background(), "m", "p", 8)
+			if e == nil || r.ErrorKind != tc.kind || r.Status != "error" {
+				t.Fatalf("got kind %q status %q err %v, want %q", r.ErrorKind, r.Status, e, tc.kind)
+			}
+		})
+	}
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	url := s.URL
+	s.Close()
+	c, _ := New(Target{Engine: "vllm", URL: url})
+	if r, _ := c.Generate(context.Background(), "m", "p", 8); r.ErrorKind != ErrorKindConnection {
+		t.Fatalf("closed server classified as %q: %s", r.ErrorKind, r.Error)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	time.Sleep(time.Millisecond)
+	if ClassifyError(ctx.Err()) != ErrorKindTimeout {
+		t.Fatal("deadline not classified as timeout")
+	}
+}
+
+// bodyTransport serves a fixed SSE body without a network listener.
+type bodyTransport string
+
+func (b bodyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+}
+
+func FuzzGenerateStream(f *testing.F) {
+	for _, seed := range []string{
+		"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":3}}\n\ndata: [DONE]\n\n",
+		"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"t\"}}]}\ndata: [DONE]\n",
+		"data: {\"error\":\"boom\"}\n\n",
+		"data: {\"usage\":{\"completion_tokens\":-4}}\n\ndata: [DONE]\n\n",
+		": comment\n\nevent: x\ndata:[DONE]\n",
+		"data: {\"choices\":null}\n\n",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, body string) {
+		c, _ := New(Target{Engine: "vllm", URL: "http://fuzz.invalid"})
+		c.HTTP = &http.Client{Transport: bodyTransport(body)}
+		r, e := c.Generate(context.Background(), "m", "p", 8)
+		if (e == nil) != (r.Status == "ok") || (e == nil) != (r.ErrorKind == "") {
+			t.Fatalf("status %q kind %q inconsistent with error %v", r.Status, r.ErrorKind, e)
+		}
+		if r.OutputTokens != nil && *r.OutputTokens < 0 || r.TTFTMs != nil && *r.TTFTMs < 0 || r.DurationMs < 0 {
+			t.Fatalf("negative measurement: %+v", r)
+		}
+		if r.TPOTMs != nil && (r.OutputTokens == nil || *r.OutputTokens < 2) {
+			t.Fatalf("TPOT without at least two reported tokens: %+v", r)
+		}
+	})
+}
+
+func TestTransportRefusesLinkLocalAddresses(t *testing.T) {
+	for _, address := range []string{"169.254.169.254:80", "[fe80::1]:80", "0.0.0.0:80", "[::]:80"} {
+		if !errors.Is(refuseLinkLocal("tcp", address, nil), errLinkLocal) {
+			t.Errorf("%s was not refused", address)
+		}
+	}
+	for _, address := range []string{"127.0.0.1:8000", "10.0.0.5:8000", "[::1]:8000"} {
+		if err := refuseLinkLocal("tcp", address, nil); err != nil {
+			t.Errorf("%s refused: %v", address, err)
+		}
+	}
+	c, _ := New(Target{Engine: "vllm", URL: "http://169.254.169.254/v1"})
+	if _, err := c.Discover(context.Background()); err == nil || !strings.Contains(err.Error(), "link-local") {
+		t.Fatalf("metadata address reachable: %v", err)
 	}
 }

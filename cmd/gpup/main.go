@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -250,21 +251,24 @@ func serveCommand(opt *cliOptions) *cobra.Command {
 	return cmd
 }
 func benchCommand(opt *cliOptions, name string) *cobra.Command {
-	var model, concurrency, prompt, save, baseline string
-	var duration, warmup time.Duration
+	var model, concurrency, rates, prompt, save, baseline string
+	var duration, warmup, sloTTFT, sloTPOT, sloE2E time.Duration
 	var maxTokens int
 	var drop, increase float64
 	var gates []string
-	cmd := &cobra.Command{Use: name + " TARGET_OR_URL", Args: cobra.ExactArgs(1), Short: "Benchmark a closed-loop concurrency sweep", RunE: func(cmd *cobra.Command, args []string) error {
-		gateDrop, gateTTFT, gateErr := parseGateRules(gates)
+	cmd := &cobra.Command{Use: name + " TARGET_OR_URL", Args: cobra.ExactArgs(1), Short: "Benchmark a closed-loop concurrency or open-loop request-rate sweep", RunE: func(cmd *cobra.Command, args []string) error {
+		gate, gateErr := parseGateRules(gates)
 		if gateErr != nil {
 			return gateErr
 		}
-		if len(gates) > 0 && baseline == "" {
-			return errors.New("--fail-if requires --compare")
+		if (gate.drop != nil || gate.ttft != nil) && baseline == "" {
+			return errors.New("throughput and ttft-p99 rules require --compare")
 		}
-		if gateDrop != nil {
-			drop = *gateDrop
+		if gate.drop != nil {
+			drop = *gate.drop
+		}
+		if rates != "" && !cmd.Flags().Changed("concurrency") {
+			concurrency = "64"
 		}
 		points := []int{}
 		for _, raw := range strings.Split(concurrency, ",") {
@@ -275,6 +279,22 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 			points = append(points, n)
 		}
 		config := bench.Config{Model: model, Prompt: prompt, Concurrency: points, DurationSeconds: duration.Seconds(), WarmupSeconds: warmup.Seconds(), MaxTokens: maxTokens, Name: save}
+		if rates != "" {
+			for _, raw := range strings.Split(rates, ",") {
+				r, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+				if err != nil {
+					return fmt.Errorf("invalid request rate %q", raw)
+				}
+				config.RequestRates = append(config.RequestRates, r)
+			}
+		}
+		if sloTTFT > 0 || sloTPOT > 0 || sloE2E > 0 {
+			ms := func(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
+			config.SLO = &bench.SLO{TTFTMs: ms(sloTTFT), TPOTMs: ms(sloTPOT), E2EMs: ms(sloE2E)}
+		}
+		if gate.goodput != nil && config.SLO == nil {
+			return errors.New("goodput rules require --slo-ttft, --slo-tpot, or --slo-e2e")
+		}
 		// Validate workload bounds before issuing traffic or registering an endpoint.
 		if model != "" {
 			if err := config.Validate(); err != nil {
@@ -331,6 +351,11 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 					return fmt.Errorf("baseline: %w", err)
 				}
 			}
+			if save != "" {
+				if existing, err := a.Run(save); err == nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "warning: run name %q already exists (%s); name lookups will resolve to the new run\n", save, existing.ID)
+				}
+			}
 			a.Start()
 			id, err := a.StartBenchmark(cmd.Context(), config)
 			if err != nil {
@@ -351,7 +376,11 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 					}
 					if j.Status == "running" {
 						if j.Progress != nil && time.Since(lastProgress) >= 5*time.Second {
-							fmt.Fprintf(cmd.ErrOrStderr(), "running · concurrency %d · %d requests · %d errors\n", j.Progress.Concurrency, j.Progress.Requests, j.Progress.Errors)
+							load := fmt.Sprintf("concurrency %d", j.Progress.Concurrency)
+							if j.Progress.RequestRate > 0 {
+								load = fmt.Sprintf("%g req/s", j.Progress.RequestRate)
+							}
+							fmt.Fprintf(cmd.ErrOrStderr(), "running · point %d/%d · %s · %d requests · %d errors\n", j.Progress.Point, j.Progress.Points, load, j.Progress.Requests, j.Progress.Errors)
 							lastProgress = time.Now()
 						}
 						continue
@@ -375,6 +404,11 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 							return errors.New("benchmark contains errors or no completed requests")
 						}
 					}
+					if gate.goodput != nil {
+						if err := checkGoodput(*j.Run, *gate.goodput); err != nil {
+							return err
+						}
+					}
 					if baseline != "" {
 						b, _ := a.Run(baseline)
 						diff, err := analysis.Compare(b, *j.Run)
@@ -385,8 +419,8 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 						if err := analysis.CheckThresholds(diff, drop, increase); err != nil {
 							return err
 						}
-						if gateTTFT != nil {
-							return analysis.CheckTTFTP99Threshold(diff, *gateTTFT)
+						if gate.ttft != nil {
+							return analysis.CheckTTFTP99Threshold(diff, *gate.ttft)
 						}
 						return nil
 					}
@@ -396,7 +430,11 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 		})
 	}}
 	cmd.Flags().StringVar(&model, "model", "", "Model ID (discover only if unambiguous)")
-	cmd.Flags().StringVar(&concurrency, "concurrency", "1,2,4,8", "Comma-separated concurrency points, 1..256")
+	cmd.Flags().StringVar(&concurrency, "concurrency", "1,2,4,8", "Comma-separated concurrency points, 1..256; with --request-rate, one in-flight cap (default 64)")
+	cmd.Flags().StringVar(&rates, "request-rate", "", "Comma-separated open-loop Poisson arrival rates in requests/second")
+	cmd.Flags().DurationVar(&sloTTFT, "slo-ttft", 0, "Goodput target for time to first token, such as 500ms")
+	cmd.Flags().DurationVar(&sloTPOT, "slo-tpot", 0, "Goodput target for time per output token, such as 50ms")
+	cmd.Flags().DurationVar(&sloE2E, "slo-e2e", 0, "Goodput target for end-to-end latency, such as 10s")
 	cmd.Flags().DurationVar(&duration, "duration", 10*time.Second, "Duration per point, max 1h")
 	cmd.Flags().DurationVar(&warmup, "warmup", 0, "Unmeasured warm-up before each point, max 10m")
 	cmd.Flags().IntVar(&maxTokens, "max-tokens", 128, "Maximum generated tokens")
@@ -405,7 +443,7 @@ func benchCommand(opt *cliOptions, name string) *cobra.Command {
 	cmd.Flags().StringVar(&baseline, "compare", "", "Baseline run ID/name for CI comparison")
 	cmd.Flags().Float64Var(&drop, "max-throughput-drop", 5, "Maximum throughput drop percent")
 	cmd.Flags().Float64Var(&increase, "max-latency-increase", 10, "Maximum E2E p95 latency increase percent")
-	cmd.Flags().StringArrayVar(&gates, "fail-if", nil, "CI rule: throughput<-5% or ttft-p99>+10% (requires --compare)")
+	cmd.Flags().StringArrayVar(&gates, "fail-if", nil, "CI rule: throughput<-5% or ttft-p99>+10% (require --compare), or goodput<95% (requires an SLO)")
 	return cmd
 }
 
@@ -458,7 +496,7 @@ func runsCommand(opt *cliOptions) *cobra.Command {
 // writeRunCSV writes one row per operating point; unavailable readings are empty.
 func writeRunCSV(w io.Writer, r bench.Run) error {
 	out := csv.NewWriter(w)
-	_ = out.Write([]string{"run_id", "name", "model", "concurrency", "requests", "errors", "duration_s", "rps", "output_tok_s", "ttft_p50_ms", "ttft_p95_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p95_ms", "itl_p50_ms", "itl_p99_ms", "e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms", "latency_sampled"})
+	_ = out.Write([]string{"run_id", "name", "model", "concurrency", "requests", "errors", "duration_s", "rps", "output_tok_s", "ttft_p50_ms", "ttft_p95_ms", "ttft_p99_ms", "tpot_p50_ms", "tpot_p95_ms", "itl_p50_ms", "itl_p99_ms", "e2e_p50_ms", "e2e_p95_ms", "e2e_p99_ms", "latency_sampled", "request_rate", "incomplete", "delayed", "goodput", "goodput_rps", "error_kinds"})
 	f := func(v float64) string { return strconv.FormatFloat(v, 'f', 3, 64) }
 	opt := func(v *float64) string {
 		if v == nil {
@@ -477,10 +515,20 @@ func writeRunCSV(w io.Writer, r bench.Run) error {
 	p99 := func(p bench.Percentiles) float64 { return p.P99 }
 	for _, p := range r.Points {
 		e2e := p.E2E
-		_ = out.Write([]string{r.ID, r.Name, r.Model, strconv.Itoa(p.Concurrency), strconv.Itoa(p.Requests), strconv.Itoa(p.Errors), f(p.DurationSeconds), f(p.RPS), opt(p.OutputTokensPerSecond), pct(p.TTFT, p50), pct(p.TTFT, p95), pct(p.TTFT, p99), pct(p.TPOT, p50), pct(p.TPOT, p95), pct(p.ITL, p50), pct(p.ITL, p99), pct(&e2e, p50), pct(&e2e, p95), pct(&e2e, p99), strconv.FormatBool(p.LatencySampled)})
+		_ = out.Write([]string{r.ID, r.Name, r.Model, strconv.Itoa(p.Concurrency), strconv.Itoa(p.Requests), strconv.Itoa(p.Errors), f(p.DurationSeconds), f(p.RPS), opt(p.OutputTokensPerSecond), pct(p.TTFT, p50), pct(p.TTFT, p95), pct(p.TTFT, p99), pct(p.TPOT, p50), pct(p.TPOT, p95), pct(p.ITL, p50), pct(p.ITL, p99), pct(&e2e, p50), pct(&e2e, p95), pct(&e2e, p99), strconv.FormatBool(p.LatencySampled), opt(p.RequestRate), strconv.Itoa(p.Incomplete), strconv.Itoa(p.Delayed), opt(p.Goodput), opt(p.GoodputRPS), errorKinds(p)})
 	}
 	out.Flush()
 	return out.Error()
+}
+
+// errorKinds formats error classes as "kind=n" pairs joined by ';'.
+func errorKinds(p bench.Point) string {
+	kinds := make([]string, 0, len(p.ErrorKinds))
+	for kind, n := range p.ErrorKinds {
+		kinds = append(kinds, fmt.Sprintf("%s=%d", kind, n))
+	}
+	sort.Strings(kinds)
+	return strings.Join(kinds, ";")
 }
 
 func sameEndpoint(a, b string) bool {
@@ -488,26 +536,49 @@ func sameEndpoint(a, b string) bool {
 	return normalize(a) == normalize(b)
 }
 
-func parseGateRules(rules []string) (drop, ttft *float64, err error) {
+type gateRules struct{ drop, ttft, goodput *float64 }
+
+func parseGateRules(rules []string) (gates gateRules, err error) {
 	for _, rule := range rules {
 		var raw string
 		var destination **float64
-		if strings.HasPrefix(rule, "throughput<-") && strings.HasSuffix(rule, "%") {
-			raw = strings.TrimSuffix(strings.TrimPrefix(rule, "throughput<-"), "%")
-			destination = &drop
-		} else if strings.HasPrefix(rule, "ttft-p99>+") && strings.HasSuffix(rule, "%") {
-			raw = strings.TrimSuffix(strings.TrimPrefix(rule, "ttft-p99>+"), "%")
-			destination = &ttft
-		} else {
-			return nil, nil, fmt.Errorf("unsupported CI rule %q; use throughput<-5%% or ttft-p99>+10%%", rule)
+		switch {
+		case strings.HasPrefix(rule, "throughput<-") && strings.HasSuffix(rule, "%"):
+			raw, destination = strings.TrimSuffix(strings.TrimPrefix(rule, "throughput<-"), "%"), &gates.drop
+		case strings.HasPrefix(rule, "ttft-p99>+") && strings.HasSuffix(rule, "%"):
+			raw, destination = strings.TrimSuffix(strings.TrimPrefix(rule, "ttft-p99>+"), "%"), &gates.ttft
+		case strings.HasPrefix(rule, "goodput<") && strings.HasSuffix(rule, "%"):
+			raw, destination = strings.TrimSuffix(strings.TrimPrefix(rule, "goodput<"), "%"), &gates.goodput
+		default:
+			return gateRules{}, fmt.Errorf("unsupported CI rule %q; use throughput<-5%%, ttft-p99>+10%%, or goodput<95%%", rule)
 		}
 		value, e := strconv.ParseFloat(raw, 64)
-		if e != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-			return nil, nil, fmt.Errorf("invalid CI rule %q", rule)
+		if e != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 || (destination == &gates.goodput && value > 100) {
+			return gateRules{}, fmt.Errorf("invalid CI rule %q", rule)
 		}
 		*destination = &value
 	}
 	return
+}
+
+// checkGoodput fails when any point's SLO attainment is below minPercent or
+// cannot be determined.
+func checkGoodput(r bench.Run, minPercent float64) error {
+	for _, p := range r.Points {
+		if p.Goodput == nil {
+			return fmt.Errorf("goodput unavailable at %s; TPOT targets need reported token usage", pointLabel(p))
+		}
+		if *p.Goodput*100 < minPercent {
+			return fmt.Errorf("goodput %.1f%% below %.1f%% at %s", *p.Goodput*100, minPercent, pointLabel(p))
+		}
+	}
+	return nil
+}
+func pointLabel(p bench.Point) string {
+	if p.RequestRate != nil {
+		return fmt.Sprintf("%g req/s", *p.RequestRate)
+	}
+	return fmt.Sprintf("concurrency %d", p.Concurrency)
 }
 func printJSON(w io.Writer, v any) error {
 	e := json.NewEncoder(w)
@@ -523,19 +594,56 @@ func value(v *float64, suffix string) string {
 func printRun(w io.Writer, r bench.Run) {
 	fmt.Fprintf(w, "Run %s %s · %s\n", r.ID, r.Name, r.Status)
 	table := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(table, "CONC\tREQ/S\tTOK/S\tTTFT P50\tTTFT P99\tE2E P95\tERRORS")
+	header := "CONC\tREQ/S\tTOK/S\tTTFT P50\tTTFT P99\tE2E P95\tERRORS\tCUT OFF"
+	if r.Config.OpenLoop() {
+		header = "RATE\t" + header + "\tDELAYED"
+	}
+	if r.Config.SLO != nil {
+		header += "\tGOODPUT"
+	}
+	fmt.Fprintln(table, header)
 	for _, p := range r.Points {
 		p50, p99 := "—", "—"
 		if p.TTFT != nil {
 			p50 = fmt.Sprintf("%.1fms", p.TTFT.P50)
 			p99 = fmt.Sprintf("%.1fms", p.TTFT.P99)
 		}
-		fmt.Fprintf(table, "%d\t%.2f\t%s\t%s\t%s\t%.1fms\t%d\n", p.Concurrency, p.RPS, value(p.OutputTokensPerSecond, ""), p50, p99, p.E2E.P95, p.Errors)
+		row := fmt.Sprintf("%d\t%.2f\t%s\t%s\t%s\t%.1fms\t%s\t%d", p.Concurrency, p.RPS, value(p.OutputTokensPerSecond, ""), p50, p99, p.E2E.P95, errorSummary(p), p.Incomplete)
+		if p.RequestRate != nil {
+			row = fmt.Sprintf("%g\t%s\t%d", *p.RequestRate, row, p.Delayed)
+		}
+		if r.Config.SLO != nil {
+			goodput := "—"
+			if p.Goodput != nil {
+				goodput = fmt.Sprintf("%.1f%%", *p.Goodput*100)
+			}
+			row += "\t" + goodput
+		}
+		fmt.Fprintln(table, row)
 	}
 	_ = table.Flush()
 	if r.Knee != nil {
 		fmt.Fprintf(w, "Observed concurrency knee: %d\n", *r.Knee)
 	}
+	for _, f := range r.Findings {
+		if r.Knee == nil || !strings.HasPrefix(f.Summary, "Observed concurrency knee") {
+			fmt.Fprintf(w, "Finding: %s\n", f.Summary)
+		}
+	}
+}
+
+// errorSummary prints the error count followed by its classes, such as
+// "3 (http_5xx:2 timeout:1)".
+func errorSummary(p bench.Point) string {
+	if p.Errors == 0 {
+		return "0"
+	}
+	kinds := make([]string, 0, len(p.ErrorKinds))
+	for kind, n := range p.ErrorKinds {
+		kinds = append(kinds, fmt.Sprintf("%s:%d", kind, n))
+	}
+	sort.Strings(kinds)
+	return fmt.Sprintf("%d (%s)", p.Errors, strings.Join(kinds, " "))
 }
 func render(s app.Snapshot, page string) string {
 	var out strings.Builder

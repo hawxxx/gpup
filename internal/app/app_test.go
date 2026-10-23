@@ -267,3 +267,49 @@ func TestHistorySurvivesRestart(t *testing.T) {
 		t.Fatalf("restored %d history points, want %d", got, want)
 	}
 }
+
+func TestOpenLoopRunRecordsRateProgressWithoutChunkGaps(t *testing.T) {
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":2}}\n\ndata: [DONE]\n\n")
+	}))
+	defer fixture.Close()
+	a, err := New(filepath.Join(t.TempDir(), "gpup.db"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	target, err := a.AddTarget(context.Background(), engine.Target{Name: "fixture", Engine: "openai", URL: fixture.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := a.StartBenchmark(context.Background(), bench.Config{TargetID: target.ID, Model: "x", Concurrency: []int{4}, RequestRates: []float64{50, 100}, DurationSeconds: 0.2, MaxTokens: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := a.Snapshot().ActiveJobs[0].Progress; p.Points != 2 || p.RequestRate != 50 {
+		t.Fatalf("open-loop progress not reported by rate: %+v", p)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		j, _ := a.Job(id)
+		if j.Status != "running" {
+			if j.Status != "complete" || len(j.Run.Points) != 2 || *j.Run.Points[1].RequestRate != 100 {
+				t.Fatalf("unexpected open-loop job: %+v", j)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("benchmark did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s := a.Snapshot()
+	if len(s.Requests) == 0 || s.Requests[0].RequestRate == 0 {
+		t.Fatalf("requests missing offered rate: %+v", s.Requests)
+	}
+	for _, r := range s.Requests {
+		if r.ChunkGapsMs != nil {
+			t.Fatal("live snapshot retains per-request chunk gaps")
+		}
+	}
+}

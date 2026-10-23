@@ -60,3 +60,37 @@ func TestTokenlessAPIRejectsDNSRebindingHost(t *testing.T) {
 		t.Fatalf("rebinding request accepted: %d", w.Code)
 	}
 }
+
+func TestSessionCookieIsDerivedAndNotTheToken(t *testing.T) {
+	h := Secure(Options{Token: "secret"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	r := httptest.NewRequest("GET", "http://localhost:7331/api/v1/snapshot", nil)
+	r.Header.Set("Authorization", "Bearer secret")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	cookies := w.Result().Cookies()
+	if w.Code != 204 || len(cookies) != 1 || cookies[0].Value == "secret" || !cookies[0].HttpOnly {
+		t.Fatalf("unexpected session cookie: %d %+v", w.Code, cookies)
+	}
+	for _, tc := range []struct {
+		cookie, header string
+		want           int
+	}{
+		{cookies[0].Value, "", 204},
+		{"secret", "", 401},
+		{"", "Bearer " + cookies[0].Value, 401},
+		{cookies[0].Value, "Bearer wrong", 401},
+	} {
+		r := httptest.NewRequest("GET", "http://localhost:7331/api/v1/stream", nil)
+		if tc.cookie != "" {
+			r.AddCookie(&http.Cookie{Name: "gpup_session", Value: tc.cookie})
+		}
+		if tc.header != "" {
+			r.Header.Set("Authorization", tc.header)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Errorf("cookie %q header %q: got %d, want %d", tc.cookie, tc.header, w.Code, tc.want)
+		}
+	}
+}

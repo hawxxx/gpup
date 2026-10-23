@@ -64,7 +64,7 @@ Run the same workload before and after a change to your inference server:
   --save optimized --compare baseline --max-throughput-drop 10 --max-latency-increase 20
 ```
 
-`--duration` applies to each concurrency point. Add `--warmup 10s` to send unmeasured traffic before each point so connection setup and cold caches do not skew results; warm-up settings must match for runs to be comparable. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
+`--duration` applies to each operating point. Add `--warmup 10s` to send unmeasured traffic before each point so connection setup and cold caches do not skew results; warm-up settings must match for runs to be comparable. Progress is printed to stderr every few seconds. Benchmarking a URL instead of a target name reuses the target already registered for that endpoint. Comparison thresholds are percentages: this example permits a 10% throughput drop and a 20% increase in E2E p95 latency. Comparisons require compatible workloads; failed workloads and incompatible runs cannot pass.
 
 You can also sweep concurrency, capture passive telemetry, or compare existing runs:
 
@@ -75,6 +75,17 @@ You can also sweep concurrency, capture passive telemetry, or compare existing r
 ```
 
 `sweep` varies client concurrency without changing engine configuration. `profile` samples observations without generating a benchmark workload. Prompts are sent to the selected inference server but are not stored in the database.
+
+### Offered load and service-level targets
+
+Concurrency sweeps are closed loops: each client waits for its response before sending the next request, so a slow server also receives less traffic. To see how latency grows under a fixed arrival rate, run an open-loop sweep. Requests arrive as a Poisson process at each rate, and `--concurrency` becomes a single in-flight cap (default 64):
+
+```sh
+./bin/gpup bench local --model my-model --request-rate 1,2,4,8 --concurrency 64 \
+  --duration 60s --slo-ttft 500ms --slo-tpot 50ms --fail-if 'goodput<95%'
+```
+
+Each point reports the offered rate, achieved requests/s, arrivals delayed by the cap, and requests cut off at the end of the window. The run reports the first offered rate the server did not sustain. With `--slo-ttft`, `--slo-tpot`, or `--slo-e2e`, each point also reports goodput: the share of measured requests, errors included, that met every target. The `goodput<N%` rule fails when any point falls below the target and does not need a baseline. Failed requests are counted by class, such as `http_5xx`, `timeout`, or `truncated`.
 
 For CI, add `--compare baseline --fail-if 'throughput<-5%' --fail-if 'ttft-p99>+10%'` to a matching benchmark command. Throughput gates prefer reported output tokens/sec and explicitly fall back to requests/sec when usage is unavailable. Latency percentiles use at most 10,000 uniformly sampled successful requests per point; mean and maximum remain exact, and each point records whether sampling occurred. See [metric semantics](docs/metrics.md) for timing definitions and measurement limits.
 
@@ -101,6 +112,12 @@ These captures use the synthetic endpoint in [`benchmarks/fixture`](benchmarks/f
 **Benchmarks.** Each run shows throughput by concurrency, the detected knee (highlighted row), and TTFT, TPOT, chunk-gap (ITL), and E2E percentiles. Completed runs can be exported as CSV or JSON or deleted; running runs show point-by-point progress.
 
 ![Benchmarks page](docs/screenshots/benchmarks.png)
+
+Open-loop runs plot throughput by offered rate and add the in-flight cap, cut-off and delayed requests, and goodput. The benchmark dialog selects the load model and optional service-level targets.
+
+![Open-loop benchmark with goodput](docs/screenshots/benchmarks-open-loop.png)
+
+![Benchmark dialog with request-rate sweep and service-level targets](docs/screenshots/benchmark-dialog.png)
 
 **Experiments.** Compare two compatible runs point by point. Here, the candidate fixture had twice the batch capacity of the baseline.
 
@@ -152,6 +169,8 @@ export GPUP_API_TOKEN='your-generated-secret'
 ```
 
 API clients send `Authorization: Bearer TOKEN`; the dashboard provides a token input. Inject the token through your environment or secret manager to avoid storing it in command history. `--token` is also available for existing launchers. Reverse proxies must preserve Host and use HTTPS to the TLS-enabled backend so origin checks remain valid.
+
+Anyone with the token can register endpoints, which makes GPUP send requests on their behalf; use `--read-only` for shared viewing. A target's API key is sent only to URLs on the target's own origin, and endpoints cannot reach link-local addresses such as cloud metadata services. See the [security model](docs/security.md) for assumptions and controls.
 
 ## GPU collection
 
@@ -270,6 +289,8 @@ See the [Helm guide](deploy/helm/gpup/README.md) and [chart values](deploy/helm/
 
 GPUP currently runs as a single local instance. Distributed collectors, cluster-wide aggregation, remote GPU discovery, multiuser RBAC/OIDC, automatic engine tuning, and AMD/Intel GPU support are deferred. Hardware accuracy and collection overhead require validation on actual GPUs; deployment examples do not imply production certification.
 
+- [Architecture](docs/architecture.md): component, data-flow, benchmark, telemetry, authentication, and lifecycle diagrams
+- [Security model](docs/security.md): threats, controls, and accepted risks
 - [Metric semantics](docs/metrics.md): timing definitions, telemetry sources, and measurement limits
 - [Scope and roadmap](docs/roadmap.md): implemented capabilities and deferred work
 - [Robustness and feature gaps](docs/research/2026-10-21-robustness-and-feature-gaps.md): fixes from the October 2026 review and ranked next steps
