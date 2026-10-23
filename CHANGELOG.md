@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.3.0](https://github.com/hawxxx/gpup/compare/v0.2.0...v0.3.0) (2026-10-23)
+
+
+### Features
+
+* **bench:** add open-loop request-rate sweeps, SLO goodput, and error classes ([88ca1ee](https://github.com/hawxxx/gpup/commit/88ca1eefe4ac5cbfe8da89aa084940570238b05f))
+* **web:** show open-loop sweeps, goodput, and error classes; meet WCAG AA contrast ([88ca1ee](https://github.com/hawxxx/gpup/commit/88ca1eefe4ac5cbfe8da89aa084940570238b05f))
+
+
+### Bug Fixes
+
+* **engine:** scope credentials to the endpoint origin and aggregate exporter series across ranks ([88ca1ee](https://github.com/hawxxx/gpup/commit/88ca1eefe4ac5cbfe8da89aa084940570238b05f))
+* **security:** refuse link-local dials, derive session cookies, and harden Helm pods ([88ca1ee](https://github.com/hawxxx/gpup/commit/88ca1eefe4ac5cbfe8da89aa084940570238b05f))
+
+
+### Performance
+
+* **app:** drop per-request chunk gaps from live snapshots ([88ca1ee](https://github.com/hawxxx/gpup/commit/88ca1eefe4ac5cbfe8da89aa084940570238b05f))
+
 ## [0.2.0](https://github.com/hawxxx/gpup/compare/v0.1.0...v0.2.0) (2026-10-21)
 
 
